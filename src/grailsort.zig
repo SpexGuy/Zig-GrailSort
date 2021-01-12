@@ -70,7 +70,7 @@ pub fn sortWithAllocatedBuffer(
 }
 
 /// Returns the optimal buffer length for a given array size.
-/// Meant for use with sortWithBuffer.
+/// Meant for use with sortExternal.
 pub fn findOptimalBufferLength(array_len: usize) usize {
     // find the smallest power of two that is at least
     // the sqrt of the length of the array.  This method
@@ -88,7 +88,7 @@ pub fn findOptimalBufferLength(array_len: usize) usize {
 /// Use findOptimalBufferLength to find the best buffer length for a given size.
 /// Buffers longer than findOptimalBufferLength are still optimal.
 /// Buffers smaller than findOptimalBufferLength may still be helpful.
-pub fn sortWithBuffer(
+pub fn sortExternal(
     comptime T: type,
     array: []T,
     context: anytype,
@@ -101,15 +101,37 @@ pub fn sortWithBuffer(
 
 // ---------------------------- Implementation -----------------------------
 
+// TODO-OPT: There are many places where this implementation could specify
+// noalias but does not.  There may be a perf benefit to doing so, especially
+// when keys are passed separately from data, or if the comparator is opaque.
+//
+// TODO-OPT: There are many places where this implementation divides by a
+// power of two.  We could consider passing around the log2 value and using
+// shifts instead, but these divisions are not usually on critical paths so
+// it may not be worth very much.
+//
+// TODO-ZEN: This implementation is not very consistent between using slices
+// and using ptr + len parameters.  It may be worth using pointers in more
+// places to make the indexing nicer, especially in places where there is
+// a junk buffer before the valid data.
+
 /// Arrays smaller than this will do insertion sort instead
+/// TODO-OPT: Tune this value.
 const TUNE_TOO_SMALL = 16;
 
 /// If the array has fewer than this many unique elements, use a sort that
 /// works better on arrays with few actual items.
+/// TODO-OPT: Tune this value.
 const TUNE_TOO_FEW_KEYS = 4;
 
-/// TODO
-const TUNE_MIN_USABLE_BUFFER = 8;
+/// If the external buffer is smaller than this many items,
+/// it's not worth the extra overhead of the out of place merge.
+/// This must always be at least 2, otherwise the out of place
+/// merge will crash.  If the buffer is less than 4 items,
+/// the out of place merge degrades to the in place merge plus
+/// some checks, so it's not worth it.
+/// TODO-OPT: Tune this value.
+const TUNE_MIN_BUILD_BLOCKS_BUFFER = 4;
 
 /// Root sorting function, used by all public api points.
 fn sortCommon(
@@ -144,103 +166,156 @@ fn sortCommon(
         return;
     }
 
-    // We'll start by collecting a number of "keys".  Keys are
-    // unique elements in the list which we will use to split up
-    // our sort.  The optimal number of keys we want is about
-    // 2 * sqrt(array.len).  We'll approximate this value, and then
-    // search the list for unique values to use.
+    // This sort works by building a "junk buffer" at the beginning
+    // of the array.  The junk buffer will be used as scratch space
+    // to accelerate other parts of the sort.  We will need to rearrange
+    // the items in the junk buffer freely.  In order to do that
+    // and maintain stability, we require that all items in the junk
+    // buffer are unique.
+
+    // The rest of the list will be split up into fixed-size blocks.
+    // These blocks must be a power of two in size, so that we can
+    // use a fast scrolling merge sort to create them.  As shown in
+    // the paper, the best size for this list is the square root of
+    // the length of the array.
 
     // This calculates the smallest power of two that is greater
     // than or equal to sqrt(array.len).
     var block_len = findOptimalBufferLength(array.len);
 
+    // We will also need a key item at the beginning of the array
+    // for each block, which we will use to maintain stability in
+    // the sort.
+
     // key_len = ceil(array.len / block_len)
     // this is safe because array.len >= 16 (and therefore > 0).
-    // The `+1` here is not actually necessary for the O(NlogN)
-    // guarantees of this sort, but is kept here for historical reasons.
+    // This could be a floor division instead if the use is updated.
     // TODO-OPT: Test a bunch of cases with and without this.
     // Does it make a meaningful difference?
     var key_len = ((array.len - 1) / block_len) + 1;
 
-    // key_len + block_len is approximately 2 * sqrt(array.len).
-    // When wrong, it is always an overestimate.
+    // So the total number of unique items needed at the start of
+    // the list is the sum of the number of keys and the block size.
     const ideal_keys = key_len + block_len;
 
-    // Collect unique keys from the array and move them to the beginning.
-    // If the list contains very many duplicate elements, keys_found may be
-    // less than ideal_keys.  It will never be more than ideal_keys, because
-    // we stop looking if we find enough.
+    // Now we can go find those keys, and move them to the front of
+    // the array.
     const keys_found = collectKeys(T, array, ideal_keys, cmp);
 
-    // Check if we have the ideal buffer size.
-    // TODO-OPT: These cases are different enough that it may be worth
-    // bifurcating the code generation statically based on this value.
-    var ideal_buffer = keys_found >= ideal_keys;
+    // In the event that the array contains very many duplicate elements,
+    // we may not be able to find enough unique keys. In that case, use
+    // one of two fallback strategies.
+    const ideal_buffer = keys_found >= ideal_keys;
     if (!ideal_buffer) {
+        // If we didn't find enough keys, use one of two fallback strategies.
         if (keys_found < TUNE_TOO_FEW_KEYS) {
-            // GRAILSORT STRATEGY 3 -- No block swaps or scrolling buffer; resort to Lazy Stable Sort
-            // This case means that there are no more than four unique elements in the whole array.
-            // Fall back to a sort that performs better in that totally ridiculous case.
+            // There are very few unique items, use a different sort.
             // TODO-OPT: Should this value be a percentage of the array length instead?
             // Or some more complicated calculation?
             lazyStableSort(T, array, cmp);
             return;
         } else {
-            // GRAILSORT STRATEGY 2 -- Block swaps with small scrolling buffer and/or lazy merges
-            // TODO: what does this do?
+            // Strategy 2: Block swaps with small scrolling buffer and/or lazy merges
+            // In this case, we will use the buffer we have to try to optimize
+            // things for a bit, and then fall back to the keyed selection +
+            // in place merge sort.  Start by reducing our initial
+            // block length to be the size of our actual buffer.
+            // TODO-OPT: key_len is a power of two, consider using @clz instead.
+            while (block_len > keys_found) {
+                block_len /= 2;
+            }
+
             key_len = block_len;
             block_len = 0;
-            ideal_buffer = false;
-
-            // TODO-OPT: key_len is a power of two, consider using @clz instead.
-            while (key_len > keys_found) {
-                key_len >>= 1;
-            }
         }
     }
 
     // In the normal case, this is the end of the keys buffer and
     // is equal to keys_found.  If there aren't enough keys, this
     // is just block_len instead.
-    var buffer_end = block_len + key_len;
+    var first_data_idx = block_len + key_len;
 
-    // This is always the block length we calculated in the loop above.
-    // It is a power of two.
+    // Our initial blocks are normally the block length.
+    // If we are in strategy 2, we will use our shortened
+    // key length instead, to account for our limited buffer.
     var subarray_len = if (ideal_buffer) block_len else key_len;
 
-    var use_buffer = ideal_buffer and buffer.len > 0;
+    // First, we need to sort each block.  This algorithm uses either
+    // the junk buffer or an external buffer to do an in place merge
+    // sort, displacing the junk buffer and moving it through the array.
+    // When all is said and done, the junk buffer will be back where
+    // it started.
+    // TODO-OPT: If the buffer len is longer than subarray_len, there
+    // is an even better optimized variant where we do an out of place
+    // reverse merge.
+    // TODO-ZEN: This `- subarray_len` is awkward, maybe use an array
+    // pointer and data length instead?
+    if (buffer.len >= TUNE_MIN_BUILD_BLOCKS_BUFFER) {
+        buildBlocksExternal(T, array[first_data_idx - subarray_len..], subarray_len, buffer, cmp);
+    } else {
+        buildBlocksInPlace(T, array[first_data_idx - subarray_len..], subarray_len, cmp);
+    }
 
-    buildBlocks(T, array[buffer_end - subarray_len..], subarray_len, buffer, cmp);
+    // At this point, pairs of blocks are sorted, so double the length.
+    subarray_len *= 2;
 
-    subarray_len <<= 1;
-    while (array.len - buffer_end > subarray_len) : (subarray_len <<= 1) {
+    // save off our data length for future use
+    const data_len = array.len - first_data_idx;
+
+    // At the start of this loop, the array always looks as follows:
+    // the keys and junk buffer are at the start of the array, unsorted.
+    // They are followed by subarrays of length subarray_len, which are
+    // each sorted.  In each iteration, we will combine and sort each
+    // pair of subarrays, to yield larger subarrays.
+    while (subarray_len < data_len) : (subarray_len *= 2) {
         var curr_block_len = block_len;
-        var scrolling_buffer = ideal_buffer;
+        var use_junk_buffer = ideal_buffer;
 
         if (!ideal_buffer) {
-            const key_buffer = key_len >> 1;
-            if (key_buffer * key_buffer >= subarray_len << 1) {
+            // Even if we don't have the ideal buffer, we might still
+            // be able to use a junk buffer for this pass.  We just
+            // need to make sure that we have enough keys for both the
+            // selection sort and the junk buffer.  We need to divvy up
+            // our keys for use as block keys vs junk buffer.
+            // since the junk buffer is the size of a block, and a
+            // subarray is the remaining number of keys times the
+            // block size, the maximum subarray size we can support
+            // is (junk_keys * block_keys) / 2.  The maximum of this
+            // function happens when junk_keys == block_keys, so our
+            // check is (subarray_len * 2) <= (key_len / 2)^2.
+            // TODO-OPT: We can get away with a slightly smaller key
+            // buffer for the last iteration, because we don't use
+            // the full subarray_len.
+            const key_buffer = key_len / 2;
+            if (key_buffer * key_buffer >= subarray_len * 2) {
                 curr_block_len = key_buffer;
-                scrolling_buffer = true;
+                use_junk_buffer = true;
             } else {
-                curr_block_len = (subarray_len << 1) / key_len;
+                // If we can't use the scrolling buffer, we are going
+                // to be doing in-place merging.  Since that's expensive,
+                // we want to use the smallest block size possible,
+                // and put more work on the selection sort.
+                curr_block_len = (subarray_len * 2) / key_len;
             }
         }
 
-        combineBlocks(T, array, buffer_end, subarray_len, curr_block_len, scrolling_buffer, buffer, cmp);
+        if (buffer.len >= curr_block_len) {
+            combineBlocksExternal(T, array, first_data_idx, subarray_len, curr_block_len, buffer, cmp);
+        } else {
+            combineBlocksInPlace(T, array, first_data_idx, subarray_len, curr_block_len, use_junk_buffer, cmp);
+        }
     }
 
-    insertSort(T, array[0..buffer_end], cmp);
-    lazyMerge(T, array, buffer_end, cmp);
+    // When all is said and done, we just have the keys at the beginning
+    // of the array, and one sorted subarray of everything else that follows
+    // it.  We'll finish by sorting the keys, and then performing an in-place
+    // merge sort of the keys and everything else.
+    // TODO-OPT: We could maybe do a better merge sort taking advantage of the
+    // external buffer.  Even though it's not big enough to hold the entire
+    // keys array, it can still help reduce swaps (or let us do them as blocks).
+    insertSort(T, array[0..first_data_idx], cmp);
+    lazyMerge(T, array, first_data_idx, cmp);
 }
-
-/// TODO document
-/// TODO relocate
-fn lazyStableSort(comptime T: type, array: []T, cmp: anytype) void {
-    // TODO
-    unreachable;
-}
-
 
 /// This function searches the list for the first ideal_keys unique elements.
 /// It puts those items at the beginning of the array in sorted order, and
@@ -311,23 +386,22 @@ fn collectKeys(comptime T: type, array: []T, ideal_keys: usize, cmp: anytype) us
     return keys_found;
 }
 
-
-/// TODO
-fn buildBlocks(comptime T: type, array: []T, block_len: usize, buffer: []T, cmp: anytype) void {
-    if (buffer.len >= TUNE_MIN_USABLE_BUFFER) {
-        buildBlocksWithBuffer(T, array, block_len, buffer, cmp);
-    } else {
-        buildBlocksInPlace(T, array, block_len, cmp);
-    }
-}
-
-/// TODO what does this do
+/// This function sorts every block of block_len elements, starting at index block_len.
+/// It uses a junk buffer of block_len elements at the beginning to accelerate the sort.
+/// This buffer may be reordered, but will be back at the beginning of the array when
+/// this function returns.
+/// TODO-OPT: We should probably use a small stack buffer of 8 or 16 elements
+/// and always call buildBlocksExternal, to optimize the first few merges.
+/// As a bonus, this would let us delete the pairwiseSwaps function.
 fn buildBlocksInPlace(comptime T: type, array: []T, block_len: usize, cmp: anytype) void {
-    // Do pairwise swaps.  This is kind of a complicated operation, see the comment
-    // on the function for more information about it.  It requires that the first two
-    // elements in the array are not equal to each other, which we know because they
-    // are known to be keys.
+    // We'll use iterative merge sorts to perform this sort.
+    // Start with an optimized version of merge sort with a size of 1.
+    // This function will also move two items of the junk buffer to the
+    // end of the array, not just one.
     pairwiseSwaps(T, array[block_len-2..], cmp);
+    // Then continue doing larger merge sorts and moving items to the end
+    // of the array.  The last merge sort is done in reverse to move the
+    // junk buffer back to the beginning.
     buildInPlace(T, array, 2, block_len, cmp);
 }
 
@@ -421,8 +495,12 @@ fn buildInPlace(comptime T: type, array: []T, already_merged_size: usize, block_
     }
 }
 
-/// TODO what does this do
-fn buildBlocksWithBuffer(comptime T: type, array: []T, block_len: usize, buffer: []T, cmp: anytype) void {
+/// This is similar to buildBlocksInPlace, but uses an external storage buffer
+/// to reduce swaps.  It will copy junk items into the external array, and then
+/// use a variant of the merge operation which clobbers the junk buffer.  Once
+/// the merge size exceeds the size of the external buffer, it falls back to the
+/// in-place version.
+fn buildBlocksExternal(comptime T: type, array: []T, block_len: usize, buffer: []T, cmp: anytype) void {
     // round the buffer length down to a power of two
     var pow2_buffer_len = buffer.len;
     if (pow2_buffer_len >= block_len) {
@@ -437,9 +515,15 @@ fn buildBlocksWithBuffer(comptime T: type, array: []T, block_len: usize, buffer:
     // copy as many keys as we can into the external block
     copyNoAlias(T, buffer.ptr, array.ptr + (block_len - pow2_buffer_len), pow2_buffer_len);
 
+    // Use a separate code path for pairs because it's much faster
+    assert(pow2_buffer_len >= 2);
     var start_position = block_len - 2;
     pairwiseWrites(T, array[start_position..], cmp);
 
+    // Then do forward merges just like in the in place version,
+    // but clobber the junk buffer instead of preserving it.
+    // TODO-ZEN: There is probably a better expression of this indexing,
+    // see lazyStableSort for inspiration.
     var merge_len: usize = 2;
     while (merge_len < pow2_buffer_len) : (merge_len *= 2) {
         const full_merge_len = merge_len * 2;
@@ -467,6 +551,8 @@ fn buildBlocksWithBuffer(comptime T: type, array: []T, block_len: usize, buffer:
 
     copyNoAlias(T, array.ptr + (array.len - pow2_buffer_len), buffer.ptr, pow2_buffer_len);
 
+    // TODO-OPT: If the external buffer is large enough, we could do an
+    // out-of-place reverse merge for even more speed.
     buildInPlace(T, array, merge_len, block_len, cmp);
 }
 
@@ -527,16 +613,15 @@ fn pairwiseWrites(comptime T: type, array: []T, cmp: anytype) void {
     }
 }
 
-/// TODO
-fn combineBlocks(comptime T: type, array: []T, first_block_idx: usize, subarray_len: usize, block_len: usize, use_junk_buffer: bool, buffer: []T, cmp: anytype) void {
-    if (buffer.len >= block_len) {
-        combineBlocksWithBuffer(T, array, first_block_idx, subarray_len, block_len, buffer, cmp);
-    } else {
-        combineBlocksInPlace(T, array, first_block_idx, subarray_len, block_len, use_junk_buffer, cmp);
-    }
-}
-
-/// TODO
+/// This function iterates pairs of subarrays of length subarray_len,
+/// starting at first_block_idx, and including the partial subarray
+/// at the end of the list.  Each subarray must be sorted, and after
+/// this call the pairs will be combined into larger sorted subarrays.
+/// There must be at least one item in the array before first_block_idx
+/// for each block in the array, excluding the final partial block.
+/// If use_junk_buffer is true, there must also be at least block_len
+/// more elements for the junk buffer, which will be used to accelerate
+/// the merge operation.
 fn combineBlocksInPlace(
     comptime T: type,
     array: []T,
@@ -546,30 +631,43 @@ fn combineBlocksInPlace(
     use_junk_buffer: bool,
     cmp: anytype,
 ) void {
+    // The total number of data items, excluding keys and the junk buffer
     const data_len = array.len - first_block_idx;
+    // The length of a merged subarray
     const full_merge_len = 2 * subarray_len;
+    // The number of full merges we will do
     var merge_count = data_len / full_merge_len;
+    // The number of items that do not fit into a full merge
     const leftover_count = data_len % full_merge_len;
+    // The number of blocks in a full merge
     const block_count = full_merge_len / block_len;
+    // The number of blocks in a subarray
     const half_block_count = @divExact(block_count, 2);
+    // The block index of the first block of the second subarray
     const initial_median = half_block_count;
 
+    // The index of the first subarray to be merged
     var merge_start: usize = first_block_idx;
+
+    // Iterate through pairs of subarrays, merging them.
+    // If we are using a junk buffer, this operation also
+    // transfers it from the left to the right.
     while (merge_count > 0) : (merge_count -= 1) {
         // The keys are used to preserve stability in blockSelectSort.
         const keys = array[0..block_count];
 
-        // We need to make sure they are in order before calling it.
+        // We need to make sure they are in order.
         insertSort(T, keys, cmp);
 
         // blockSelectSort will do a selection sort on the blocks in the array.
-        // TODO: Why does this help?
+        // It also permutes the keys to match.  This puts blocks in closer to the
+        // right order, allowing us to combine them with mergeBlocks.
         const median_key = blockSelectSort(T, keys.ptr, array.ptr + merge_start, initial_median, block_count, block_len, cmp);
 
         if (use_junk_buffer) {
-            mergeBlocks(T, keys.ptr, median_key, array.ptr + (merge_start - block_len), block_count, block_len, 0, 0, cmp);
+            mergeBlocks(T, keys.ptr, median_key, array.ptr + (merge_start - block_len), block_count, block_len, 0, 0, true, cmp);
         } else {
-            lazyMergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, block_count, block_len, 0, 0, cmp);
+            mergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, block_count, block_len, 0, 0, false, cmp);
         }
 
         merge_start += full_merge_len;
@@ -586,12 +684,17 @@ fn combineBlocksInPlace(
 
         // The +1 here adds an extra key which tracks the trailer items.
         // TODO-OPT: I don't think we actually need a key for the trailer.
+        // hmm, we do always need one for the median though.
         const keys = array[0..trailer_blocks+1];
         insertSort(T, keys, cmp);
 
         // perform our selection sort as usual, including even blocks that
-        // may not end up being part of the standard sort.
-        const median_key = blockSelectSort(T, keys.ptr, array.ptr + merge_start, initial_median, trailer_blocks, block_len, cmp);
+        // may not end up being part of the standard sort.  Only do this if
+        // we have full blocks on the right side.  If it's just a partial block,
+        // everything except the partial block is already sorted (because it's
+        // all the left side).
+        const median_key = if (trailer_blocks <= half_block_count) initial_median
+            else blockSelectSort(T, keys.ptr, array.ptr + merge_start, initial_median, trailer_blocks, block_len, cmp);
 
         // This counts the number of full blocks at the end of the trailer
         // that cannot participate in the standard merge because they come
@@ -619,6 +722,7 @@ fn combineBlocksInPlace(
             // are all in sorted order.  So we just need to merge the trailer
             // items with the sorted left half.
             const left_len = normal_blocks * block_len;
+
             if (use_junk_buffer) {
                 mergeForwards(T, array[merge_start - block_len..], block_len, left_len, trailer_items, cmp);
             } else {
@@ -628,20 +732,21 @@ fn combineBlocksInPlace(
             const unfit_items = block_len * unfit_trailer_blocks + trailer_items;
             // Common case, some blocks participate in the merge.
             if (use_junk_buffer) {
-                mergeBlocks(T, keys.ptr, median_key, array.ptr + (merge_start - block_len), normal_blocks, block_len, unfit_trailer_blocks, unfit_items, cmp);
+                mergeBlocks(T, keys.ptr, median_key, array.ptr + (merge_start - block_len), normal_blocks, block_len, unfit_trailer_blocks, unfit_items, true, cmp);
             } else {
-                lazyMergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, normal_blocks, block_len, unfit_trailer_blocks, unfit_items, cmp);
+                mergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, normal_blocks, block_len, unfit_trailer_blocks, unfit_items, false, cmp);
             }
         }
     }
 
+    // If we have a junk buffer, we need to move it back to the beginning of the list.
     if (use_junk_buffer) {
         moveFrontToBack(T, array[first_block_idx - block_len..], data_len);
     }
 }
 
 /// TODO
-fn combineBlocksWithBuffer(
+fn combineBlocksExternal(
     comptime T: type,
     array: []T,
     first_block_idx: usize,
@@ -794,15 +899,19 @@ fn mergeBlocks(
     block_len          : usize,
     trailer_blocks     : usize,
     trailer_len        : usize,
+    comptime use_junk_buffer: bool,
     cmp                : anytype,
 ) void {
-    const keys = keys_ptr[0..block_count + trailer_blocks];
-    const blocks = blocks_ptr[0..block_len + block_count * block_len + trailer_len];
+    const junk_len = if (use_junk_buffer) block_len else 0;
+
+    // if this is the last segment, we may need one extra item for the median key.
+    const keys = keys_ptr[0..block_count + trailer_blocks + 1];
+    const blocks = blocks_ptr[0..junk_len + block_count * block_len + trailer_len];
 
     // When we start, our first block is after the junk buffer
     // (at index block_len), and the next block is one block
     // after that.
-    var next_block = block_len + block_len;
+    var next_block = junk_len + block_len;
     var curr_block_len = block_len;
 
     // This origin tells us which subarray the current block
@@ -810,7 +919,7 @@ fn mergeBlocks(
     // TODO: we will use it for what?
     // true means left, false means right.
     // TODO-OPT: I think we can just check median_key to see if it's
-    // equal to zero here, it must be either zero or block_count/2.
+    // equal to zero here, keys[0] must be either zero or block_count/2.
     var curr_block_from_left_subarray = cmp.lessThan(keys[0], keys[median_key]);
 
     var key_idx: usize = 1; // TODO rename to next_block
@@ -831,10 +940,12 @@ fn mergeBlocks(
             // in the next block.  The current block is also sorted, so we
             // can just move it to the sorted part of the list, and swap it
             // with the displaced junk buffer.
-            // TODO-OPT: This preserves the order of the junk buffer,
-            // there may be an opportunity to speed it up by giving up
-            // that constraint.
-            blockSwap(T, blocks.ptr + curr_block - block_len, blocks.ptr + curr_block, curr_block_len);
+            if (use_junk_buffer) {
+                // TODO-OPT: This preserves the order of the junk buffer,
+                // there may be an opportunity to speed it up by giving up
+                // that constraint.
+                blockSwap(T, blocks.ptr + curr_block - junk_len, blocks.ptr + curr_block, curr_block_len);
+            }
 
             // After doing that, we know that the next block we grab will be a
             // full block, so set the length accordingly.
@@ -851,17 +962,29 @@ fn mergeBlocks(
             // At that point, we will stop merging, change our current block to be
             // the remaining list, and then grab the next unchecked block as the new second list.
 
-            // Iterators for our two arrays and output buffer
-            var buffer_idx = curr_block - block_len;
-            var left = curr_block;
-            const left_end = left + curr_block_len;
-            var right = left_end;
-            const right_end = right + block_len;
+            if (use_junk_buffer) {
+                // Iterators for our two arrays and output buffer
+                var buffer_idx = curr_block - junk_len;
 
-            // Merge sort until we reach the end of one of the merge arrays.
-            // These two loops are extremely similar, but they differ in
-            // how they handle ties between the left and right sides.
-            if (curr_block_from_left_subarray) {
+                // For stability, when items are equal, we need to prefer items
+                // from the left subarray.  For this merge, we are always merging
+                // between separate sub-arrays.  `left` will always be items from
+                // the `left` subarray, and `right` will always be from the right.
+                // TODO-ZEN: I think we can keep these iterators consistent
+                // and avoid all this ugliness by making them persistent outside
+                // of this scope.  It would also let us get rid of the
+                // curr_block_from_left_subarray variable.
+                var left = if (curr_block_from_left_subarray) curr_block
+                    else next_block;
+                const left_end = left + if (curr_block_from_left_subarray) curr_block_len
+                    else block_len;
+                var right = if (curr_block_from_left_subarray) next_block
+                    else curr_block;
+                const right_end = right + if (curr_block_from_left_subarray) block_len
+                    else curr_block_len;
+
+                // Merge sort until we reach the end of one of the merge arrays.
+                // TODO-ZEN: Can we combine this with other merge sort code?
                 while (left < left_end and right < right_end) {
                     if (cmp.lessThan(blocks[right], blocks[left])) {
                         const tmp = blocks[right];
@@ -876,48 +999,101 @@ fn mergeBlocks(
                     }
                     buffer_idx += 1;
                 }
-            } else {
-                while (left < left_end and right < right_end) {
-                    if (cmp.lessThan(blocks[left], blocks[right])) {
-                        const tmp = blocks[left];
-                        blocks[left] = blocks[buffer_idx];
-                        blocks[buffer_idx] = tmp;
-                        left += 1;
-                    } else {
-                        const tmp = blocks[right];
-                        blocks[right] = blocks[buffer_idx];
-                        blocks[buffer_idx] = tmp;
-                        right += 1;
-                    }
-                    buffer_idx += 1;
-                }
-            }
 
-            // At this point, one of the arrays is empty.
-            if (left < left_end) {
-                // If it's the right array, we have junk buffer that moved into
+                // TODO-ZEN: I think we can get rid of all of this cleanup,
+                // but I'm not totally sure how yet.
+    
+                // At this point, only one of the arrays is empty.  Check if
+                // it's the current one.  If so, we have junk buffer that moved into
                 // the right array, which is now on the right of the current
-                // array.  We need to move the remaining parts of the left
+                // array.  We need to move the remaining parts of the current
                 // array to the right of the junk buffer.
                 // TODO-OPT: I don't think we actually need to do this if we
                 // use smarter iterators.
-                moveFrontToBack(T, blocks[left..right_end], left_end - left);
+                if (left < left_end and curr_block_from_left_subarray) {
+                    moveFrontToBack(T, blocks[left..right_end], left_end - left);
+                } else if (right < right_end and !curr_block_from_left_subarray) {
+                    moveFrontToBack(T, blocks[right..left_end], right_end - right);
+                } else {
+                    // Our "current" block is now the block that was "next", so
+                    // update the subarray to match.
+                    curr_block_from_left_subarray = next_block_from_left_subarray;
+                }
 
-                // Our "current block" is now the remaining items in the left
-                // buffer.  We don't need to update the subarray source value
-                // because we are still processing the same block.
-                curr_block_len = left_end - left;
-            } else {
-                // If it's the left array, the junk buffer is now fully to
-                // the left of the remaining array items, so we don't need
-                // to move it.  Just update the current block to point to
-                // the remaining items.
-                curr_block_len = right_end - right;
-                
-                // We are next going to process what is left of the next block.
-                // So update the subarray source to match.
-                curr_block_from_left_subarray = next_block_from_left_subarray;
-            }
+                // Update the current block to point to the remaining items.
+                // One of the following two terms must be zero.
+                curr_block_len = (right_end - right) + (left_end - left);
+            } else { // use_junk_buffer
+                // In place merge sort.  This is pretty expensive, so make
+                // sure that the blocks aren't already sorted, just in case.
+                // TODO-ZEN: There must be a way to merge these cases. They
+                // are EXACTLY the same except one calls binarySearchLeft
+                // and the other calls binarySearchRight.
+                // ... and the lessThan check is different.
+                if (curr_block_from_left_subarray) {
+                    if (cmp.lessThan(blocks[next_block], blocks[next_block-1])) {
+                        var rest = blocks[next_block - curr_block_len .. next_block + block_len];
+                        while (curr_block_len > 0) {
+                            // find the insert index in the right list
+                            const insert_idx = curr_block_len + binarySearchLeft(T, rest[curr_block_len..], rest[0], cmp);
+                            // move the left list to that index
+                            rotate(T, rest[0..insert_idx], curr_block_len);
+
+                            // If we moved it to the end of the right list, we need
+                            // to grab the next chunk.  Stop merging here.
+                            if (insert_idx == rest.len) {
+                                curr_block_len = rest.len;
+                                break;
+                            }
+
+                            // leave one item here
+                            curr_block_len -= 1;
+                            // TODO-OPT: Probably worth doing a greedy check
+                            // here to see if we can immediately cement more items.
+                            rest = rest[insert_idx - curr_block_len..];
+                        } else {
+                            // the loop terminated normally, meaning the left list ran out.
+                            // leave the rest of the right list as the curr block.
+                            curr_block_len = rest.len;
+                            curr_block_from_left_subarray = next_block_from_left_subarray;
+                        }
+                    } else {
+                        curr_block_len = block_len;
+                        curr_block_from_left_subarray = next_block_from_left_subarray;
+                    }
+                } else {
+                    if (!cmp.lessThan(blocks[next_block-1], blocks[next_block])) {
+                        var rest = blocks[next_block - curr_block_len .. next_block + block_len];
+                        while (curr_block_len > 0) {
+                            // find the insert index in the right list
+                            const insert_idx = curr_block_len + binarySearchRight(T, rest[curr_block_len..], rest[0], cmp);
+                            // move the left list to that index
+                            rotate(T, rest[0..insert_idx], curr_block_len);
+
+                            // If we moved it to the end of the right list, we need
+                            // to grab the next chunk.  Stop merging here.
+                            if (insert_idx == rest.len) {
+                                curr_block_len = rest.len;
+                                break;
+                            }
+
+                            // leave one item here
+                            curr_block_len -= 1;
+                            // TODO-OPT: Probably worth doing a greedy check
+                            // here to see if we can immediately cement more items.
+                            rest = rest[insert_idx - curr_block_len..];
+                        } else {
+                            // the loop terminated normally, meaning the left list ran out.
+                            // leave the rest of the right list as the curr block.
+                            curr_block_len = rest.len;
+                            curr_block_from_left_subarray = next_block_from_left_subarray;
+                        }
+                    } else {
+                        curr_block_len = block_len;
+                        curr_block_from_left_subarray = next_block_from_left_subarray;
+                    }
+                } // curr_block_from_left_subarray
+            } // use_junk_buffer
         }
 
         // After all that, move to the next block.
@@ -950,7 +1126,9 @@ fn mergeBlocks(
             // sorted, and no items to the right of it will be part of it.
             // This means we can move the remaining items directly into the
             // sorted part of the array.
-            blockSwap(T, blocks.ptr + curr_block - block_len, blocks.ptr + curr_block, curr_block_len);
+            if (use_junk_buffer) {
+                blockSwap(T, blocks.ptr + curr_block - junk_len, blocks.ptr + curr_block, curr_block_len);
+            }
             curr_block = next_block;
 
             // Everything after this point must come from the left array, for
@@ -963,30 +1141,19 @@ fn mergeBlocks(
         // side blocks that were incompatible with the trailer items, and the trailer items.
         // Use a merge sort.  We can use the buffer here because the trailer is shorter
         // than a block.
-        mergeForwards(T, blocks[curr_block-block_len..], block_len, curr_block_len, trailer_len - block_len * trailer_blocks, cmp);
+        if (use_junk_buffer) {
+            mergeForwards(T, blocks[curr_block-junk_len..], block_len, curr_block_len, trailer_len - block_len * trailer_blocks, cmp);
+        } else {
+            lazyMerge(T, blocks[curr_block..], curr_block_len, cmp);
+        }
     } else {
         // If there's no trailer (the common case), any remaining items are
         // sorted.  We just need to move the buffer across them, so that the
         // next iteration can use it.
-        blockSwap(T, blocks.ptr + (curr_block-block_len), blocks.ptr + curr_block, curr_block_len);
+        if (use_junk_buffer) {
+            blockSwap(T, blocks.ptr + (curr_block-junk_len), blocks.ptr + curr_block, curr_block_len);
+        }
     }
-}
-
-/// TODO
-fn lazyMergeBlocks(
-    comptime T         : type,
-    noalias keys_ptr   : [*]const T,
-    median_key         : usize,
-    noalias blocks_ptr : [*]T,
-    block_count        : usize,
-    block_len          : usize,
-    trailer_blocks     : usize,
-    trailer_len        : usize,
-    cmp                : anytype,
-) void {
-    const keys = keys_ptr[0..block_count];
-    const blocks = blocks_ptr[0..block_count * block_len + trailer_len];
-    unreachable; // TODO
 }
 
 /// This function accepts an array made up of three parts:
@@ -1114,26 +1281,79 @@ fn mergeForwardExternal(comptime T: type, array: []T, buffer_len: usize, left_le
     }
 }
 
-/// TODO
+/// This function performs an iterative fully in-place merge sort of the array,
+/// starting with a fully unsorted list and working its way up.  We use it
+/// in the case where the array has very few unique items.  (specifically, fewer
+/// than four).
+/// TODO-OPT: There are probably better sorts for this case.  Since we know there
+/// are only four unique items in the array, we could even use Counting Sort.  Otherwise,
+/// quicksort is asymptotically optimal for arrays with a small number of unique items.
+fn lazyStableSort(comptime T: type, array: []T, cmp: anytype) void {
+    // sort pairs in-place
+    var i: usize = 1;
+    while (i < array.len) : (i += 2) {
+        if (cmp.lessThan(array[i], array[i-1])) {
+            const tmp = array[i-1];
+            array[i-1] = array[i];
+            array[i] = tmp;
+        }
+    }
+
+    // iteratively do merge sort with larger sets of items.
+    var merge_size: usize = 2;
+    while (merge_size < array.len) : (merge_size *= 2) {
+        var full_merge = merge_size * 2;
+
+        // Merge pairs of sorted blocks
+        var merge_index: usize = 0;
+        while (merge_index + full_merge <= array.len) : (merge_index += full_merge) {
+            lazyMerge(T, array[merge_index..][0..full_merge], merge_size, cmp);
+        }
+
+        // Check for a partial block at the end
+        if (merge_index + merge_size < array.len) {
+            lazyMerge(T, array[merge_index..], merge_size, cmp);
+        }
+    }
+}
+
+/// This function performs an in-place merge sort, without using a junk buffer.
+/// It is much slower than mergeForward and mergeForwardExternal, so those should
+/// be preferred if possible.
 fn lazyMerge(comptime T: type, array: []T, left_len: usize, cmp: anytype) void {
+    // For performance, always sort the shorter array into the longer one.
+    // TODO-OPT: The reference implementation has a tight loop to recognize
+    // when multiple keys are already in order and avoid unnecessary binary
+    // search calls.  This is probably worth doing, since the relevant items
+    // are cached and it's a quick check.
     const right_len = array.len - left_len;
     if (left_len <= right_len) {
+        // If left is smaller, iteratively find insertion points in the right
+        // half and move the left array to that index with `rotate`.
         var rest = array;
         var left_remain = left_len;
         while (rest.len > left_remain and left_remain > 0) {
+            // find the insertion index
             const insert_idx = binarySearchLeft(T, rest[left_remain..], rest[0], cmp) + left_remain;
+            // move the left array to that index
             rotate(T, rest[0..insert_idx], left_remain);
+            // leave the smallest element here
             left_remain -= 1;
             rest = rest[insert_idx - left_remain..];
         }
     } else {
+        // If right is smaller, iteratively find insertion points in the left
+        // half and move the right array to that index with `rotate`.
         var rest = array;
         var right_remain = right_len;
         while (rest.len > right_remain and right_remain > 0) {
+            // find the insertion index
             const left_remain = rest.len - right_remain;
             const insert_idx = binarySearchRight(T, rest[0..left_remain], rest[rest.len-1], cmp);
+            // move the right array to that index
             const insert_len = left_remain - insert_idx;
             rotate(T, rest[insert_idx..], insert_len);
+            // leave the largest element here
             right_remain -= 1;
             rest = rest[0..insert_idx + right_remain];
         }
@@ -1144,14 +1364,18 @@ fn lazyMerge(comptime T: type, array: []T, left_len: usize, cmp: anytype) void {
 /// unsorted right half and moves them to the sorted left half
 /// until the entire array is sorted.
 fn insertSort(comptime T: type, array: []T, cmp: anytype) void {
+    // items to the left of i are sorted
     var i: usize = 1;
     while (i < array.len) : (i += 1) {
         var left = i;
         const item = array[i];
+        // scan left to find the insertion point,
+        // copying greater elements to the right.
         while (left > 0 and cmp.lessThan(item, array[left-1])) {
             array[left] = array[left-1];
             left -= 1;
         }
+        // insert the item.
         array[left] = item;
     }
 }
@@ -1162,7 +1386,11 @@ fn insertSort(comptime T: type, array: []T, cmp: anytype) void {
 fn binarySearchLeft(comptime T: type, array: []const T, target: T, cmp: anytype) usize {
     var left: usize = 0;
     var right = array.len;
+    // TODO-OPT: consider using a duffs device branchless search.
     while (left < right) {
+        // this is equivalent to (right - left)/2, but avoids overflow.
+        // TODO-OPT: may not be worth it though? analyze the possibility
+        // for overflow here and consider not having it.
         const middle = left + (right - left) / 2;
         if (cmp.lessThan(array[middle], target)) {
             left = middle + 1;
@@ -1173,11 +1401,17 @@ fn binarySearchLeft(comptime T: type, array: []const T, target: T, cmp: anytype)
     return left;
 }
 
-/// 
+/// Finds the index of the left-most value in the sorted array
+/// that is strictly greater than the target.  If there is no
+/// such element, the length of the array is returned.
 fn binarySearchRight(comptime T: type, array: []const T, target: T, cmp: anytype) usize {
     var left: usize = 0;
     var right = array.len;
+    // TODO-OPT: consider using a duffs device branchless search.
     while (left < right) {
+        // this is equivalent to (right - left)/2, but avoids overflow.
+        // TODO-OPT: may not be worth it though? analyze the possibility
+        // for overflow here and consider not having it.
         const middle = left + (right - left) / 2;
         if (cmp.lessThan(target, array[middle])) {
             right = middle;
@@ -1196,7 +1430,7 @@ fn moveFrontToBack(
     array: []T,
     buffer_len: usize,
 ) void {
-    // TODO_OPT: Use a stack buffer to accelerate this, or use SSE
+    // TODO-OPT: Use a stack buffer to accelerate this, or use SSE
     var front = buffer_len;
     var back = array.len;
     while (front > 0) {
@@ -1215,7 +1449,7 @@ fn moveBackToFront(
     array: []T,
     buffer_len: usize,
 ) void {
-    // TODO_OPT: Use a stack buffer to accelerate this, or use SSE
+    // TODO-OPT: Use a stack buffer to accelerate this, or use SSE
     var front: usize = 0;
     var back = array.len - buffer_len;
     while (back < array.len) : ({front += 1; back += 1;}) {
@@ -1317,14 +1551,19 @@ const Tests = struct {
             "mergeBackwards",
             "mergeForwardExternal",
             "lazyMerge",
+            "lazyStableSort",
             "collectKeys",
             "pairwiseSwaps",
             "pairwiseWrites",
             "buildInPlace",
             "mergeBlocks_noTrailer",
             "mergeBlocks_withTrailer",
+            "mergeBlocks_noTrailerLazy",
+            "mergeBlocks_withTrailerLazy",
             "combineBlocksInPlace",
+            "combineBlocksInPlace_lazy",
             "sort_inPlace_enoughKeys",
+            "sort_inPlace_notEnoughKeys",
         };
 
         print("Running tests...\n", .{});
@@ -1355,6 +1594,31 @@ const Tests = struct {
             24, 25, 26, 27, 28, 29, 30, 31,
             33, 32, 35, 34, 36, 37, 38, 39,
             40,
+        };
+
+        testing.expectEqualSlices(u32, &sorted, &array);
+    }
+
+    test "sort_inPlace_notEnoughKeys" { test_sort_inPlace_notEnoughKeys(); }
+    fn test_sort_inPlace_notEnoughKeys() void {
+        var array = [_]u32{
+            17,  0,  8, 14, 11,  3, 12, 14,
+             3,  2,  1,  6,  7, 13,  6,  8,
+             5, 13, 16, 16,  1, 15,  0, 20,
+             5, 19, 18, 18,  4,  2, 15,  7,
+            11,  9, 19,  4, 10, 17, 10,  9,
+            12,
+        };
+
+        sort(u32, &array, {}, asc_ignoreBottomBitFn);
+
+        const sorted = [_]u32{
+             0,  1,  1,  0,  3,  3,  2,  2,
+             5,  5,  4,  4,  6,  7,  6,  7,
+             8,  8,  9,  9, 11, 11, 10, 10,
+            12, 13, 13, 12, 14, 14, 15, 15,
+            17, 16, 16, 17, 19, 18, 18, 19,
+            20,
         };
 
         testing.expectEqualSlices(u32, &sorted, &array);
@@ -1622,6 +1886,91 @@ const Tests = struct {
         testing.expectEqualSlices(u32, &sorted_data, data[4..]);
     }
 
+    test "combineBlocksInPlace_lazy" { test_combineBlocksInPlace_lazy(); }
+    fn test_combineBlocksInPlace_lazy() void {
+        // for this test, the block size is 4.
+        // we will merge four subarrays of four blocks into two subarrays of eight blocks.
+        // this is the initial state:
+        var buffer = [69]u32{
+            // canary 0
+            0xdeadb0a7,
+            // 8 keys for our max 8 blocks
+            1<<20, 1<<21, 1<<22, 1<<23,
+            1<<24, 1<<25, 1<<26, 1<<27,
+            // canary 1
+            0xdeadbeef,
+
+            // subarray 1
+            // four blocks of left list, sorted
+            2, 4, 6, 8,
+            10, 10, 10, 10,
+            10, 12, 12, 20,
+            22, 30, 60, 100,
+            // four blocks of right list, sorted
+            3, 3, 7, 7,
+            7, 9, 9, 11,
+            11, 15, 19, 25,
+            35, 37, 39, 41,
+
+            // subarray 2, partial
+            // four blocks of left list, sorted
+            2, 4, 6, 8,
+            10, 10, 10, 10,
+            12, 12, 12, 20,
+            22, 30, 60, 100,
+            // two and a half blocks of right list, sorted
+            1, 3, 3, 5,
+            7, 7, 7, 7,
+            11, 50,
+
+            // end canary
+            0xcafebabe,
+        };
+
+        // references to chunks of the buffer
+        const canary0 = &buffer[0];
+        const keys: []u32 = buffer[1..9];
+        const canary1 = &buffer[9];
+        const data: []u32 = buffer[10..68];
+        const canary2 = &buffer[68];
+
+        const key_sum = sum(u32, keys);
+
+        // do the combine
+        combineBlocksInPlace(u32, buffer[1..68], 9, 4 * 4, 4, false, asc_ignoreBottomBit);
+
+        const sorted_data = [_]u32{
+            // subarray 0
+            2, 3, 3, 4,
+            6, 7, 7, 7,
+            8, 9, 9, 10,
+            10, 10, 10, 10,
+            11, 11, 12, 12,
+            15, 19, 20, 22,
+            25, 30, 35, 37,
+            39, 41, 60, 100,
+            // subarray 1
+            1, 2, 3, 3,
+            4, 5, 6, 7,
+            7, 7, 7, 8,
+            10, 10, 10, 10,
+            11, 12, 12, 12,
+            20, 22, 30, 50,
+            60, 100,
+        };
+
+        // the canaries should be untouched
+        testing.expectEqual(@as(u32, 0xdeadb0a7), canary0.*);
+        testing.expectEqual(@as(u32, 0xdeadbeef), canary1.*);
+        testing.expectEqual(@as(u32, 0xcafebabe), canary2.*);
+
+        // the keys must all exist but may be in any order
+        testing.expectEqual(key_sum, sum(u32, keys));
+
+        // the data should be sorted
+        testing.expectEqualSlices(u32, &sorted_data, data);
+    }
+
     test "mergeBlocks_noTrailer" { test_mergeBlocks_noTrailer(); }
     fn test_mergeBlocks_noTrailer() void {
         // for this test, the block size is 4.
@@ -1692,7 +2041,7 @@ const Tests = struct {
         testing.expectEqual(@as(usize, 1), median_key);
 
         // merge the blocks together
-        mergeBlocks(u32, keys.ptr, median_key, data.ptr, 8, 4, 0, 0, asc_ignoreBottomBit);
+        mergeBlocks(u32, keys.ptr, median_key, data.ptr, 8, 4, 0, 0, true, asc_ignoreBottomBit);
 
         const sorted_data = [32]u32{
             2, 3, 3, 4,
@@ -1789,7 +2138,7 @@ const Tests = struct {
 
         // merge the blocks together
         const trailer_len = unfit_blocks * 4 + 2;
-        mergeBlocks(u32, keys.ptr, median_key, data.ptr, 6 - unfit_blocks, 4, unfit_blocks, trailer_len, asc_ignoreBottomBit);
+        mergeBlocks(u32, keys.ptr, median_key, data.ptr, 6 - unfit_blocks, 4, unfit_blocks, trailer_len, true, asc_ignoreBottomBit);
 
         const sorted_data = [_]u32{
             1, 2, 3, 3,
@@ -1811,6 +2160,182 @@ const Tests = struct {
         testing.expectEqualSlices(u32, &sorted_data, data[0..26]);
         // the junk buffer should be after the data, but may be reordered.
         testing.expectEqual(junk_sum, sum(u32, data[26..]));
+    }
+
+    test "mergeBlocks_noTrailerLazy" { test_mergeBlocks_noTrailerLazy(); }
+    fn test_mergeBlocks_noTrailerLazy() void {
+        // for this test, the block size is 4.
+        // we have 8 blocks total from two lists of 4.
+        // this is the initial state:
+        var buffer = [43]u32{
+            // canary 0
+            0xdeadb0a7,
+            // 8 keys for our 8 blocks
+            1000, 1001, 1002, 1003,
+            1004, 1005, 1006, 1007,
+            // canary 1
+            0xdeadbeef,
+            // four blocks of left list, sorted
+            2, 4, 6, 8,
+            10, 10, 10, 10,
+            10, 12, 12, 20,
+            22, 30, 60, 100,
+            // four blocks of right list, sorted
+            3, 3, 7, 7,
+            7, 9, 9, 11,
+            11, 15, 19, 25,
+            35, 37, 39, 41,
+            // end canary
+            0xcafebabe,
+        };
+
+        // references to chunks of the buffer
+        const canary0 = &buffer[0];
+        const keys: []u32 = buffer[1..9];
+        const canary1 = &buffer[9];
+        const data: []u32 = buffer[10..42];
+        const canary2 = &buffer[42];
+
+        // First, selection sort the blocks (not including the junk buffer)
+        const median_key = blockSelectSort(u32, keys.ptr, data.ptr, 4, 8, 4, asc_ignoreBottomBit);
+
+        // Now the buffer should look like this:
+        const selected_buffer = [_]u32{
+            // canary 0
+            0xdeadb0a7,
+            // 8 keys, permuted in the same way as the blocks
+            1000, 1004, 1005, 1001,
+            1002, 1006, 1003, 1007,
+            // canary 1
+            0xdeadbeef,
+            // eight blocks from the two lists, sorted by starting value
+            2, 4, 6, 8,
+            3, 3, 7, 7,
+            7, 9, 9, 11,
+            10, 10, 10, 10,
+            10, 12, 12, 20,
+            11, 15, 19, 25,
+            22, 30, 60, 100,
+            35, 37, 39, 41,
+            // end canary
+            0xcafebabe,
+        };
+        testing.expectEqualSlices(u32, &selected_buffer, &buffer);
+        // The median key has moved to index 1.
+        testing.expectEqual(@as(usize, 1), median_key);
+
+        // merge the blocks together
+        mergeBlocks(u32, keys.ptr, median_key, data.ptr, 8, 4, 0, 0, false, asc_ignoreBottomBit);
+
+        const sorted_data = [32]u32{
+            2, 3, 3, 4,
+            6, 7, 7, 7,
+            8, 9, 9, 10,
+            10, 10, 10, 10,
+            11, 11, 12, 12,
+            15, 19, 20, 22,
+            25, 30, 35, 37,
+            39, 41, 60, 100,
+        };
+
+        // the canaries and keys should be untouched
+        testing.expectEqual(@as(u32, 0xdeadb0a7), canary0.*);
+        testing.expectEqual(@as(u32, 0xdeadbeef), canary1.*);
+        testing.expectEqual(@as(u32, 0xcafebabe), canary2.*);
+        testing.expectEqualSlices(u32, selected_buffer[1..9], keys);
+
+        // the data should be sorted
+        testing.expectEqualSlices(u32, &sorted_data, data);
+    }
+
+    test "mergeBlocks_withTrailerLazy" { test_mergeBlocks_withTrailerLazy(); }
+    fn test_mergeBlocks_withTrailerLazy() void {
+        // for this test, the block size is 4.
+        // we have 6 and a half blocks total, 
+        // this is the initial state:
+        var buffer = [35]u32{
+            // canary 0
+            0xdeadb0a7,
+            // 6 keys for our 6 blocks
+            1000, 1001, 1002, 1003,
+            1004, 1005,
+            // canary 1
+            0xdeadbeef,
+            // four blocks of left list, sorted
+            2, 4, 6, 8,
+            10, 10, 10, 10,
+            12, 12, 12, 20,
+            22, 30, 60, 100,
+            // two and a half blocks of right list, sorted
+            1, 3, 3, 5,
+            7, 7, 7, 7,
+            11, 50,
+            // end canary
+            0xcafebabe,
+        };
+
+        const junk_sum = sum(u32, buffer[8..12]);
+
+        // references to chunks of the buffer
+        const canary0 = &buffer[0];
+        const keys: []u32 = buffer[1..7];
+        const canary1 = &buffer[7];
+        const data: []u32 = buffer[8..34];
+        const canary2 = &buffer[34];
+
+        // First, selection sort the blocks (not including the junk buffer)
+        const median_key = blockSelectSort(u32, keys.ptr, data.ptr, 4, 6, 4, asc_ignoreBottomBit);
+
+        // Now this is the buffer:
+        const selected_buffer = [_]u32{
+            // canary 0
+            0xdeadb0a7,
+            // 6 keys for our 6 blocks, permuted
+            1004, 1000, 1005, 1001, 1002, 1003,
+            // canary 1
+            0xdeadbeef,
+            // all six blocks, sorted by first value
+            1, 3, 3, 5,
+            2, 4, 6, 8,
+            7, 7, 7, 7,
+            10, 10, 10, 10,
+            12, 12, 12, 20, // these two are unfit to participate in the normal sort
+            22, 30, 60, 100,
+            // trailers, not sorted
+            11, 50,
+            // end canary
+            0xcafebabe,
+        };
+
+        testing.expectEqualSlices(u32, &selected_buffer, &buffer);
+        // 1004 is now in index 0
+        testing.expectEqual(@as(usize, 0), median_key);
+
+        const unfit_blocks = countLastMergeBlocks(u32, data, 6, 4, asc_ignoreBottomBit);
+        testing.expectEqual(@as(usize, 2), unfit_blocks);
+
+        // merge the blocks together
+        const trailer_len = unfit_blocks * 4 + 2;
+        mergeBlocks(u32, keys.ptr, median_key, data.ptr, 6 - unfit_blocks, 4, unfit_blocks, trailer_len, false, asc_ignoreBottomBit);
+
+        const sorted_data = [_]u32{
+            1, 2, 3, 3,
+            4, 5, 6, 7,
+            7, 7, 7, 8,
+            10, 10, 10, 10,
+            11, 12, 12, 12,
+            20, 22, 30, 50,
+            60, 100,
+        };
+
+        // the canaries and keys should be untouched
+        testing.expectEqual(@as(u32, 0xdeadb0a7), canary0.*);
+        testing.expectEqual(@as(u32, 0xdeadbeef), canary1.*);
+        testing.expectEqual(@as(u32, 0xcafebabe), canary2.*);
+        testing.expectEqualSlices(u32, selected_buffer[1..7], keys);
+
+        // the data should be sorted
+        testing.expectEqualSlices(u32, &sorted_data, data);
     }
 
     test "mergeForwards" { test_mergeForwards(); }
@@ -1882,6 +2407,31 @@ const Tests = struct {
         testing.expectEqualSlices(u32, &[_]u32{ 2, 3, 4, 4, 5, 6, 9, 11, 15, 32, 32 }, buffer[1..12]);
         // we don't care what's in the new junk buffer
         testing.expectEqual(@as(u32, 0xcafebabe), buffer[17]);
+    }
+
+    test "lazyStableSort" { test_lazyStableSort(); }
+    fn test_lazyStableSort() void {
+        var array = [_]u32{
+            17, 30,  8, 14, 11,  3, 12, 24,
+            33,  2,  1, 36, 37, 23,  6, 38,
+             5, 13, 26, 16, 31, 15,  0, 20,
+            35, 19, 18, 28, 34, 32, 25,  7,
+            21,  9, 29,  4, 10, 27, 40, 39,
+            22,  
+        };
+
+        lazyStableSort(u32, &array, asc_ignoreBottomBit);
+
+        const sorted = [_]u32{
+             1,  0,  3,  2,  5,  4,  6,  7,
+             8,  9, 11, 10, 12, 13, 14, 15,
+            17, 16, 19, 18, 20, 21, 23, 22,
+            24, 25, 26, 27, 28, 29, 30, 31,
+            33, 32, 35, 34, 36, 37, 38, 39,
+            40,
+        };
+
+        testing.expectEqualSlices(u32, &sorted, &array);
     }
 
     test "lazyMerge" { test_lazyMerge(); }

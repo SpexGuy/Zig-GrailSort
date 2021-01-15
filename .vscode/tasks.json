@@ -39,6 +39,22 @@
             "group": "build",
         },
         {
+            "label": "build-bench-tracy",
+            "type": "shell",
+            "command": "zig",
+            "args": ["build", "build-bench"],
+            "problemMatcher": [],
+            "group": "build",
+        },
+        {
+            "label": "build-bench-release",
+            "type": "shell",
+            "command": "zig",
+            "args": ["build", "build-bench", "-Drelease-safe=true"],
+            "problemMatcher": [],
+            "group": "build",
+        },
+        {
             "label": "test",
             "type": "shell",
             "command": "zig",

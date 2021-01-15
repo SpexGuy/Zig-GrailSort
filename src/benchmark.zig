@@ -11,6 +11,7 @@ const verify_sorted = true;
 
 pub fn main() void {
     tracy.InitThread();
+    tracy.SetThreadName("main");
 
     //doIntTests(u8);
     //doIntTests(i32);
@@ -50,18 +51,24 @@ fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comp
     checkSorted(T, golden, lessThan);
 
     print(" --------------- {: >9} {} {} ---------------- \n", .{sort, @typeName(T), benchmark});
-    print("    Items :   Average |       Max |       Min\n", .{});
+    print("    Items : ns / item |    ms avg |    ms max |    ms min\n", .{});
  
-    var array_len: usize = 10;
+    var array_len: usize = 10000;
     while (array_len <= max_len) : (array_len *= 10) {
-        const runs = 100_000_000 / array_len;
+        const len_zone = tracy.ZoneN(@src(), "len");
+        defer len_zone.End();
+        len_zone.Value(array_len);
+
+        var runs = 100_000_000 / array_len;
+        if (runs > 1000) runs = 1000;
         var run_rnd = std.rand.DefaultPrng.init(seed_rnd.random.int(u64));
 
-        tracy.Plot("Array Size", @intToFloat(f64, array_len));
+        tracy.PlotU("Array Size", array_len);
 
         var min_time: u64 = ~@as(u64, 0);
         var max_time: u64 = 0;
         var total_time: u64 = 0;
+        var total_cycles: u64 = 0;
 
         var run_id: usize = 0;
         while (run_id < runs) : (run_id += 1) {
@@ -71,9 +78,7 @@ fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comp
             setRandom(T, part, golden[0..array_len], seed);
 
             var time = std.time.Timer.start() catch unreachable;
-            const zone = tracy.ZoneN(@src(), "sort");
             sortFn(T, part, {}, lessThan);
-            zone.End();
             const elapsed = time.read();
 
             checkSorted(T, part, lessThan);
@@ -84,7 +89,9 @@ fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comp
         }
 
         const avg_time = total_time / runs;
-        print("{: >9} : {d: >9.3} | {d: >9.3} | {d: >9.3}\n", .{ array_len, millis(avg_time), millis(max_time), millis(min_time) });
+        print("{: >9} : {d: >9.3} | {d: >9.3} | {d: >9.3} | {d: >9.3}\n",
+            .{ array_len, @intToFloat(f64, avg_time) / @intToFloat(f64, array_len),
+                millis(avg_time), millis(max_time), millis(min_time) });
     }
 }
 
@@ -127,4 +134,21 @@ fn removeBits(comptime T: type, comptime bits: comptime_int) fn(void, T, T) bool
             return (a >> bits) < (b >> bits);
         }
     }.shiftLess;
+}
+
+/// This function converts a time in nanoseconds to
+/// the equivalent value that would have been returned
+/// from rdtsc to get that duration.
+fn nanosToCycles(nanos: u64) u64 {
+    // The RDTSC instruction does not actually count
+    // processor cycles or retired instructions.  It
+    // counts real time relative to an arbitrary clock.
+    // The speed of this clock is hardware dependent.
+    // You can find the values here:
+    // https://github.com/torvalds/linux/blob/master/tools/power/x86/turbostat/turbostat.c#L5172-L5184
+    // (search for 24000000 if they have moved)
+    // For the purposes of this function, we will
+    // assume that we're running on a skylake processor or similar,
+    // which updates at 24 MHz
+    return nanos * 24 / 1000;
 }

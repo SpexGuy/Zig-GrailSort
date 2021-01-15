@@ -101,6 +101,8 @@ pub fn sortExternal(
 
 // ---------------------------- Implementation -----------------------------
 
+const tc = @import("tracy.zig");
+
 // TODO-OPT: There are many places where this implementation could specify
 // noalias but does not.  There may be a perf benefit to doing so, especially
 // when keys are passed separately from data, or if the comparator is opaque.
@@ -161,6 +163,8 @@ fn sortCommon(
     comptime lessThanFn: fn(context:@TypeOf(context), lhs: T, rhs: T) bool,
     buffer: []T,
 ) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
     const Comparator = struct {
         //! This struct just cleans up the parameter lists of inner functions.
         context: @TypeOf(context),
@@ -378,6 +382,9 @@ fn sortCommon(
 /// TODO-OPT: With an external buffer, we don't need to rewind or preserve keys,
 /// we just need to move any not-chosen keys up past the key area.
 fn collectKeys(comptime T: type, array: []T, ideal_keys: usize, cmp: anytype) usize {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     // The number of keys we have found so far.  Since the first
     // item in the array is always unique, we always count it.
     var keys_found: usize = 1;
@@ -472,6 +479,9 @@ fn buildBlocksInPlace(comptime T: type, array: []T, block_len: usize, cmp: anyty
 /// The keys may be reordered during this process.  block_len and already_merged_size
 /// must both be powers of two.
 fn buildInPlace(comptime T: type, array: []T, already_merged_size: usize, block_len: usize, cmp: anytype) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     assert(std.math.isPowerOfTwo(block_len));
     assert(std.math.isPowerOfTwo(already_merged_size));
     assert(already_merged_size <= block_len);
@@ -488,6 +498,10 @@ fn buildInPlace(comptime T: type, array: []T, already_merged_size: usize, block_
     // and also move some keys to the end.
     var merge_len = already_merged_size;
     while (merge_len < block_len) : (merge_len *= 2) {
+        const tc_merge = tc.ZoneN(@src(), "merge");
+        defer tc_merge.End();
+        tc_merge.Value(merge_len);
+
         const full_merge_len = 2 * merge_len;
         
         // Our buffer will be the same size as our merge chunk.  That's how many
@@ -557,6 +571,9 @@ fn buildInPlace(comptime T: type, array: []T, already_merged_size: usize, block_
 /// in-place version.
 /// TODO-ZEN: Combine this with buildBlocksInPlace
 fn buildBlocksExternal(comptime T: type, array: []T, block_len: usize, buffer: []T, cmp: anytype) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     // round the buffer length down to a power of two
     var pow2_buffer_len = if (buffer.len >= block_len) block_len
         else std.math.floorPowerOfTwo(usize, buffer.len);
@@ -674,6 +691,9 @@ fn pairwiseSwaps(comptime T: type, array: []T, cmp: anytype) void {
 /// It will sort it to
 ///   [5 6  3 4  7 8  9  X X]
 fn pairwiseWrites(comptime T: type, array: []T, cmp: anytype) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     var index: usize = 3;
     while (index < array.len) : (index += 2) {
         // check if the items are out of order, ensuring that equal items
@@ -716,6 +736,10 @@ fn combineBlocks(
     external_buffer: []T,
     cmp: anytype,
 ) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+    tcc.Value(subarray_len);
+
     // The total number of data items, excluding keys and the junk buffer
     const data_len = array.len - first_block_idx;
     // The length of a merged subarray
@@ -992,6 +1016,9 @@ fn mergeBlocks(
     comptime mode      : BufferMode,
     cmp                : anytype,
 ) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     const junk_len = if (mode == .no_buffer) 0 else block_len;
 
     // if this is the last segment, we may need one extra item for the median key.
@@ -1038,6 +1065,9 @@ fn mergeBlocks(
             // full block, so set the length accordingly.
             curr_block_len = block_len;
         } else {
+            const tc_merge = tc.ZoneN(@src(), "Smart Merge");
+            defer tc_merge.End();
+
             // If the next two blocks don't come from same sub-array, they need
             // to be merged. We know that the last item in the left array is smaller
             // than the first item in the following block from the left array.
@@ -1293,6 +1323,8 @@ inline fn moveFrontPastJunk(comptime T: type, array: []T, data_len: usize, compt
 /// while rotating the sliding buffer to the end.  The sliding buffer may be reordered
 /// during this process.
 fn mergeForwards(comptime T: type, data_start: [*]T, buffer_len: usize, left_len: usize, right_len: usize, cmp: anytype) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
     // The buffer must be at least as large as the right array,
     // to prevent overwriting the left array.
     assert(buffer_len >= right_len);
@@ -1482,6 +1514,8 @@ fn mergeBackwardExternal(comptime T: type, array: [*]T, left_len: usize, right_l
 /// would need extra storage though, and quicksort is not stable, so
 /// those are out.  But we could at least use external storage maybe.
 fn lazyStableSort(comptime T: type, array: []T, cmp: anytype) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
     // sort pairs in-place
     var i: usize = 1;
     while (i < array.len) : (i += 2) {
@@ -1515,6 +1549,8 @@ fn lazyStableSort(comptime T: type, array: []T, cmp: anytype) void {
 /// be preferred if possible.
 /// TODO-OPT: This can absolutely use external storage if available.
 fn lazyMerge(comptime T: type, array: []T, left_len: usize, cmp: anytype) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
     // For performance, always sort the shorter array into the longer one.
     // TODO-OPT: The reference implementation has a tight loop to recognize
     // when multiple keys are already in order and avoid unnecessary binary
@@ -1624,6 +1660,9 @@ fn moveFrontToBack(
     array: []T,
     buffer_len: usize,
 ) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     // TODO-OPT: Use a stack buffer to accelerate this, or use SSE
     var front = buffer_len;
     var back = array.len;
@@ -1660,6 +1699,9 @@ fn moveBackToFront(
     array: []T,
     buffer_len: usize,
 ) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     // TODO-OPT: Use a stack buffer to accelerate this, or use SSE
     var front: usize = 0;
     var back = array.len - buffer_len;

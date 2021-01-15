@@ -44,7 +44,7 @@ fn linkTracy(step: *LibExeObjStep, enable: bool) void {
     if (enable) {
         step.addCSourceFile("tracy/TracyClient.cpp", &[_][]const u8{
             "-DTRACY_ENABLE",
-            "-fno-sanitize=undefined",
+            //"-fno-sanitize=undefined",
         });
     }
     

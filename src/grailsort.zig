@@ -151,7 +151,7 @@ const TUNE_MIN_BUILD_BLOCKS_BUFFER = 4;
 
 /// If this is true, when running with an external buffer,
 /// the junk buffer will be filled with undefined.
-const DEBUG_SET_UNDEFINED = true;
+const DEBUG_SET_UNDEFINED = false;
 
 /// Root sorting function, used by all public api points.
 fn sortCommon(
@@ -221,10 +221,6 @@ fn sortCommon(
     // We only need to include the junk buffer in the keys if we
     // don't have a large enough external buffer.  Otherwise the
     // junk buffer is stable so it doesn't need to be unique.
-    // TODO: This is a lie, buildBlocksExternal destabilizes the
-    // keys because it always does the reverse merge in place.
-    // We need to do that out of place to keep the keys stable.
-    // TODO: Verify that the tests hit this edge case.
     var ideal_keys = if (ideal_external_buffer) key_len else (key_len + block_len);
 
     // Now we can go find those keys, and move them to the front of
@@ -284,10 +280,7 @@ fn sortCommon(
     // sort, displacing the junk buffer and moving it through the array.
     // When all is said and done, the junk buffer will be back where
     // it started.
-    // TODO-OPT: If the buffer len is longer than subarray_len, there
-    // is an even better optimized variant where we do an out of place
-    // reverse merge.
-    // TODO-OPT: Also in that case, we don't even need to write the
+    // TODO-OPT: With an ideal buffer, we don't even need to write the
     // junk buffer back to the array, we can keep it external forever.
     // TODO-ZEN: This `- subarray_len` is awkward, maybe use an array
     // pointer and data length instead?
@@ -382,6 +375,8 @@ fn sortCommon(
 /// returns the number of unique values that it found to put in that buffer.
 /// TODO-OPT: The keys at the beginning do not actually need to be in sorted order.
 /// There might be a way to optimize this that clobbers order.
+/// TODO-OPT: With an external buffer, we don't need to rewind or preserve keys,
+/// we just need to move any not-chosen keys up past the key area.
 fn collectKeys(comptime T: type, array: []T, ideal_keys: usize, cmp: anytype) usize {
     // The number of keys we have found so far.  Since the first
     // item in the array is always unique, we always count it.
@@ -544,14 +539,14 @@ fn buildInPlace(comptime T: type, array: []T, already_merged_size: usize, block_
     if (last_block_len <= block_len) {
         rotate(T, array[final_offset..], last_block_len);
     } else {
-        mergeBackwards(T, array[final_offset..], block_len, last_block_len - block_len, block_len, cmp);
+        mergeBackwards(T, array.ptr + final_offset, block_len, last_block_len - block_len, block_len, cmp);
     }
 
     // Now continue to merge backwards through the rest of the array, back to the beginning.
     var merge_index = final_offset;
     while (remaining_full_blocks > 0) : (remaining_full_blocks -= 1) {
         merge_index -= full_merge_len;
-        mergeBackwards(T, array[merge_index..], block_len, block_len, block_len, cmp);
+        mergeBackwards(T, array.ptr + merge_index, block_len, block_len, block_len, cmp);
     }
 }
 
@@ -560,6 +555,7 @@ fn buildInPlace(comptime T: type, array: []T, already_merged_size: usize, block_
 /// use a variant of the merge operation which clobbers the junk buffer.  Once
 /// the merge size exceeds the size of the external buffer, it falls back to the
 /// in-place version.
+/// TODO-ZEN: Combine this with buildBlocksInPlace
 fn buildBlocksExternal(comptime T: type, array: []T, block_len: usize, buffer: []T, cmp: anytype) void {
     // round the buffer length down to a power of two
     var pow2_buffer_len = if (buffer.len >= block_len) block_len
@@ -604,12 +600,44 @@ fn buildBlocksExternal(comptime T: type, array: []T, block_len: usize, buffer: [
 
     assert(start_position + pow2_buffer_len == block_len);
 
-    copyNoAlias(T, array.ptr + (array.len - pow2_buffer_len), buffer.ptr, pow2_buffer_len);
-    setUndefined(T, buffer[0..pow2_buffer_len]);
+    // If our buffer can hold the whole block size, we can
+    // do an out of place reverse merge as well.
+    if (pow2_buffer_len == block_len) {
+        const full_merge_len = 2 * block_len;
+        const data_len = array.len - block_len;
+        // TODO-OPT: Pretty sure this is a power of two, we can use a mask here instead.
+        const last_block_len = data_len % full_merge_len;
+        var remaining_full_blocks = data_len / full_merge_len;
+        const final_offset = data_len - last_block_len;
 
-    // TODO-OPT: If the external buffer is large enough, we could do an
-    // out-of-place reverse merge for even more speed.
-    buildInPlace(T, array, merge_len, block_len, cmp);
+        // First we have to consider the special case of the partially sorted block
+        // at the end of the array.  If it's smaller than a block, we can just rotate it.
+        // Otherwise, we need to do a merge.
+        if (last_block_len <= block_len) {
+            rotate(T, array[final_offset..], last_block_len);
+        } else {
+            mergeBackwardExternal(T, array.ptr + final_offset, block_len, last_block_len - block_len, block_len, cmp);
+        }
+
+        // Now continue to merge backwards through the rest of the array, back to the beginning.
+        var merge_index = final_offset;
+        while (remaining_full_blocks > 0) : (remaining_full_blocks -= 1) {
+            merge_index -= full_merge_len;
+            mergeBackwardExternal(T, array.ptr + merge_index, block_len, block_len, block_len, cmp);
+        }
+
+        // Then restore the buffer.
+        // TODO-OPT: This isn't necessary, we can keep using the buffer.
+        copyNoAlias(T, array.ptr + (block_len - pow2_buffer_len), buffer.ptr, pow2_buffer_len);
+        setUndefined(T, buffer[0..pow2_buffer_len]);
+    } else {
+        copyNoAlias(T, array.ptr + (array.len - pow2_buffer_len), buffer.ptr, pow2_buffer_len);
+        setUndefined(T, buffer[0..pow2_buffer_len]);
+
+        // TODO-OPT: If the external buffer is large enough, we could do an
+        // out-of-place reverse merge for even more speed.
+        buildInPlace(T, array, merge_len, block_len, cmp);
+    }
 }
 
 /// This function inspects every pair of elements in the given array,
@@ -978,8 +1006,10 @@ fn mergeBlocks(
 
     // This origin tells us which subarray the current block
     // came from, before we did the selection sort on blocks.
-    // TODO: we will use it for what?
-    // true means left, false means right.
+    // true means left, false means right.  The subarrays were
+    // originally sorted, so if we find two adjacent blocks
+    // from the same subarray, we know they are already sorted,
+    // and we can skip forward a block without any work.
     // TODO-OPT: I think we can just check median_key to see if it's
     // equal to zero here, keys[0] must be either zero or block_count/2.
     var curr_block_from_left_subarray = cmp.lessThan(keys[0], keys[median_key]);
@@ -1312,8 +1342,7 @@ fn mergeForwards(comptime T: type, data_start: [*]T, buffer_len: usize, left_len
 /// It merges the left and right halves into a single sorted buffer at the end,
 /// while rotating the sliding buffer to the beginning.  The sliding buffer may be
 /// reordered during this process.
-/// TODO-ZEN: Make the parameters here match mergeForwards, this is just silly.
-fn mergeBackwards(comptime T: type, array: []T, left_len: usize, right_len: usize, buffer_len: usize, cmp: anytype) void {
+fn mergeBackwards(comptime T: type, array: [*]T, left_len: usize, right_len: usize, buffer_len: usize, cmp: anytype) void {
     // The buffer must be at least as large as the left array,
     // to prevent overwriting the right array.
     // At the end we assume that the remainder of the right
@@ -1351,7 +1380,7 @@ fn mergeBackwards(comptime T: type, array: []T, left_len: usize, right_len: usiz
     // TODO-OPT: This preserves the order of the junk buffer, but we don't actually need that.
     if (right != buffer) {
         const remain = right - right_end;
-        blockSwap(T, array.ptr + right_end, array.ptr + (buffer - remain), remain);
+        blockSwap(T, array + right_end, array + (buffer - remain), remain);
     }
 }
 
@@ -1400,6 +1429,49 @@ fn mergeForwardExternal(comptime T: type, data_ptr: [*]T, buffer_len: usize, lef
         // is the case, is it worth bifurcating codegen?
         moveBackToClobberFront(T, array[buffer..left_end], left_end - left);
     }
+}
+
+/// Like mergeForwards, this function accepts an array made up of three parts:
+/// a sorted left half, a sorted right half, and a sliding buffer, in that order.
+/// It merges the left and right halves into a single sorted buffer at the end,
+/// clobbering the data at the beginning.
+fn mergeBackwardExternal(comptime T: type, array: [*]T, left_len: usize, right_len: usize, buffer_len: usize, cmp: anytype) void {
+    // The buffer must be at least as large as the left array,
+    // to prevent overwriting the right array.
+    // At the end we assume that the remainder of the right
+    // buffer does not alias the final junk buffer.  This
+    // happens when the left array is at least as large as
+    // the junk buffer.  So they must be exactly equal.
+    assert(buffer_len == left_len);
+
+    // Iterators.  These are empty, that is they point to the slot after the next element.
+    const left_end: usize = 0;
+    var left = left_len;
+    const right_end = left;
+    var right = right_end + right_len;
+    var buffer = right + buffer_len;
+
+    while (left > left_end) {
+        buffer -= 1;
+        // TODO-OPT: This could be made branchless, test that and see if it's faster.
+        if (right == right_end or cmp.lessThan(array[right-1], array[left-1])) {
+            left -= 1;
+            array[buffer] = array[left];
+        } else {
+            right -= 1;
+            array[buffer] = array[right];
+        }
+    }
+
+    // If anything remains on the right side, move it directly to the beginning of the list.
+    // We only need to do this if there is more buffer in the way, otherwise it is
+    // already at the beginning of the list.
+    // TODO-OPT: This preserves the order of the junk buffer, but we don't actually need that.
+    if (right != buffer) {
+        const remain = right - right_end;
+        copyNoAlias(T, array + (buffer - remain), array + right_end, remain);
+    }
+    setUndefined(T, array[0..buffer_len]);
 }
 
 /// This function performs an iterative fully in-place merge sort of the array,
@@ -1727,6 +1799,7 @@ const Tests = struct {
             "pairwiseSwaps",
             "pairwiseWrites",
             "buildInPlace",
+            "buildBlocksExternal",
             "mergeBlocks_noTrailer",
             "mergeBlocks_withTrailer",
             "mergeBlocks_noTrailerLazy",
@@ -1982,6 +2055,85 @@ const Tests = struct {
 
         testing.expectEqual(key_sum, sum(u32, buffer[0..4]));
         testing.expectEqualSlices(u32, &sorted, buffer[4..]);
+    }
+
+    test "buildBlocksExternal" { test_buildBlocksExternal(); }
+    fn test_buildBlocksExternal() void {
+        var external_buffer: [10]u32 = undefined;
+        for (external_buffer[1..9]) |_, i| {
+            if (i < 2) continue;
+            // We're going to go from sorted blocks of two to blocks of 8.
+            // This will do one forward merge pass and one reverse merge pass.
+            var buffer = [_]u32{
+                // four keys at the beginning
+                1<<20, 1<<21, 1<<22, 1<<23,
+
+                // in order
+                2, 4, 6, 8,
+                10, 12, 14, 16, 
+                // reversed           
+                16, 14, 12, 10,
+                8, 6, 4, 2,
+                // mixed 1
+                2, 4, 10, 12,
+                6, 8, 14, 16,
+                // mixed 2
+                16, 14, 6, 8,
+                10, 12, 4, 2,
+                // mixed 3
+                16, 6, 8, 14,
+                12, 2, 4, 10,
+                // stability
+                8, 10, 2, 4,
+                3, 5, 9, 7, 
+                // stability 2
+                7, 9, 5, 3,
+                2, 4, 8, 10,
+                // stability 3
+                5, 4, 3, 2,
+                9, 8, 7, 6,
+
+                // trailer
+                6, 8, 4, 2,
+                5, 10, 7,
+            };
+
+            external_buffer[0] = 0xBADF00D5;
+            external_buffer[i+1] = 0;
+
+            // N.B. block size is 4, to produce chunks of size 8.
+            buildBlocksExternal(u32, &buffer, 4, external_buffer[1..i+1], asc_ignoreBottomBit);
+
+            // verify canaries
+            testing.expectEqual(@as(u32, 0xBADF00D5), external_buffer[0]);
+            testing.expectEqual(@as(u32, 0), external_buffer[i+1]);
+
+            const sorted = [_]u32{
+                // to preserve stability, the keys must be
+                // unmodified at the beginning.
+                1<<20, 1<<21, 1<<22, 1<<23,
+
+                2, 4, 6, 8, 10, 12, 14, 16, // 0
+                2, 4, 6, 8, 10, 12, 14, 16, // 8
+                2, 4, 6, 8, 10, 12, 14, 16, // 16
+                2, 4, 6, 8, 10, 12, 14, 16, // 24
+                2, 4, 6, 8, 10, 12, 14, 16, // 32
+                2, 3, 4, 5, 7, 8, 9, 10,    // 40
+                3, 2, 5, 4, 7, 9, 8, 10,    // 48
+                3, 2, 5, 4, 7, 6, 9, 8,     // 56
+                2, 4, 5, 6, 7, 8, 10,       // 64
+            };
+
+            if (i >= 4) {
+                // keys must be stable if we have an ideal buffer
+                testing.expectEqualSlices(u32, &sorted, &buffer);
+            } else {
+                // otherwise we just need the data to be preserved,
+                // order is not important.
+                testing.expectEqual(sum(u32, sorted[0..4]), sum(u32, buffer[0..4]));
+                testing.expectEqualSlices(u32, sorted[4..], buffer[4..]);
+            }
+        }
     }
 
     test "pairwiseSwaps" { test_pairwiseSwaps(); }

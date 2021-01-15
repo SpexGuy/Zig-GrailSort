@@ -944,7 +944,7 @@ fn countLastMergeBlocks(
 ) usize {
     var blocks_to_merge_manually: usize = 0;
     var first_item_after_blocks = trailer_blocks * block_len;
-    var curr_full_block = first_item_after_blocks - block_len;
+    var curr_full_block = first_item_after_blocks;
 
     // We can include a block in the normal sort as long as that
     // block's first item is less than or equal to the trailer.
@@ -958,7 +958,7 @@ fn countLastMergeBlocks(
     // array when the sort began.
     while (blocks_to_merge_manually < trailer_blocks and
         cmp.lessThan(trailer[first_item_after_blocks],
-                     trailer[curr_full_block])) {
+                     trailer[curr_full_block - block_len])) {
         blocks_to_merge_manually += 1;
         curr_full_block -= block_len;
     }

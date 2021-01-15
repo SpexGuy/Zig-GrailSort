@@ -2,31 +2,39 @@ const std = @import("std");
 const grail = @import("grailsort.zig");
 const testing = std.testing;
 const print = std.debug.print;
+const tracy = @import("tracy.zig");
 
 var gpa_storage = std.heap.GeneralPurposeAllocator(.{}){};
 const gpa = &gpa_storage.allocator;
 
-const verify_sorted = false;
+const verify_sorted = true;
 
 pub fn main() void {
-    doIntTests(u8);
-    doIntTests(i32);
+    tracy.InitThread();
+
+    //doIntTests(u8);
+    //doIntTests(i32);
     doIntTests(u32);
-    doIntTests(usize);
+    //doIntTests(usize);
 }
 
 fn doIntTests(comptime T: type) void {
-    doAllKeyCases("std.sort" , "unique", T, std.sort.sort, comptime std.sort.asc(T) , comptime doIntCast(T));
+    //doAllKeyCases("std.sort" , "unique", T, std.sort.sort, comptime std.sort.asc(T) , comptime doIntCast(T));
     doAllKeyCases("grailsort", "unique", T, grail.sort   , comptime std.sort.asc(T) , comptime doIntCast(T));
-    doAllKeyCases("std.sort" , "x2"    , T, std.sort.sort, comptime removeBits(T, 1), comptime doIntCast(T));
+    //doAllKeyCases("std.sort" , "x2"    , T, std.sort.sort, comptime removeBits(T, 1), comptime doIntCast(T));
     doAllKeyCases("grailsort", "x2"    , T, grail.sort   , comptime removeBits(T, 1), comptime doIntCast(T));
-    doAllKeyCases("std.sort" , "x8"    , T, std.sort.sort, comptime removeBits(T, 3), comptime doIntCast(T));
+    //doAllKeyCases("std.sort" , "x8"    , T, std.sort.sort, comptime removeBits(T, 3), comptime doIntCast(T));
     doAllKeyCases("grailsort", "x8"    , T, grail.sort   , comptime removeBits(T, 3), comptime doIntCast(T));
-    doAllKeyCases("std.sort" , "x32"   , T, std.sort.sort, comptime removeBits(T, 5), comptime doIntCast(T));
+    //doAllKeyCases("std.sort" , "x32"   , T, std.sort.sort, comptime removeBits(T, 5), comptime doIntCast(T));
     doAllKeyCases("grailsort", "x32"   , T, grail.sort   , comptime removeBits(T, 5), comptime doIntCast(T));
 }
 
 fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comptime sortFn: anytype, comptime lessThan: fn(void, T, T) bool, comptime fromInt: fn(usize) T) void {
+    const ctx = tracy.Zone(@src());
+    defer ctx.End();
+
+    ctx.Name(benchmark);
+
     const max_len = 10_000_000;
 
     const array = gpa.alloc(T, max_len) catch unreachable;
@@ -49,6 +57,8 @@ fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comp
         const runs = 100_000_000 / array_len;
         var run_rnd = std.rand.DefaultPrng.init(seed_rnd.random.int(u64));
 
+        tracy.Plot("Array Size", @intToFloat(f64, array_len));
+
         var min_time: u64 = ~@as(u64, 0);
         var max_time: u64 = 0;
         var total_time: u64 = 0;
@@ -61,7 +71,9 @@ fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comp
             setRandom(T, part, golden[0..array_len], seed);
 
             var time = std.time.Timer.start() catch unreachable;
+            const zone = tracy.ZoneN(@src(), "sort");
             sortFn(T, part, {}, lessThan);
+            zone.End();
             const elapsed = time.read();
 
             checkSorted(T, part, lessThan);
@@ -100,7 +112,11 @@ fn setRandom(comptime T: type, array: []T, golden: []const T, seed: u64) void {
 fn doIntCast(comptime T: type) fn(usize) T {
     return struct {
         fn doCast(v: usize) T {
-            return @intCast(T, v);
+            if (T == u8) {
+                return @truncate(T, v);
+            } else {
+                return @intCast(T, v);
+            }
         }
     }.doCast;
 }

@@ -6,10 +6,16 @@ const LibExeObjStep = std.build.LibExeObjStep;
 pub fn build(b: *Builder) void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
+    const tracy_enabled = b.option(bool, "tracy", "Enable tracy in the benchmarks.  Defaults to true.") orelse true;
 
     const bench_exe = b.addExecutable("bench", "src/benchmark.zig");
     setDependencies(b, bench_exe, mode, target);
+    linkTracy(bench_exe, tracy_enabled);
+
     bench_exe.install();
+
+    const build_bench = b.step("build-bench", "Build benchmarks");
+    build_bench.dependOn(&bench_exe.install_step.?.step);
 
     const bench_run = bench_exe.run();
     if (b.args) |args| bench_run.addArgs(args);
@@ -30,4 +36,20 @@ fn setDependencies(b: *Builder, step: *LibExeObjStep, mode: anytype, target: any
     step.setBuildMode(mode);
     step.setTarget(target);
     step.linkLibC();
+}
+
+fn linkTracy(step: *LibExeObjStep, enable: bool) void {
+    step.addBuildOption(bool, "tracy_enabled", enable);
+    step.addIncludeDir("tracy");
+    if (enable) {
+        step.addCSourceFile("tracy/TracyClient.cpp", &[_][]const u8{
+            "-DTRACY_ENABLE",
+            "-fno-sanitize=undefined",
+        });
+    }
+    
+    if (step.target.isWindows()) {
+        step.linkSystemLibrary("Advapi32");
+        step.linkSystemLibrary("User32");
+    }
 }

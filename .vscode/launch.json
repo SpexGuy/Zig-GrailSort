@@ -17,6 +17,18 @@
             "preLaunchTask": "${defaultBuildTask}",
         },
         {
+            "name": "Debug Benchmarks",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/zig-cache/bin/bench.exe",
+            "args": [],
+            "stopAtEntry": false,
+            "cwd": "${workspaceFolder}",
+            "environment": [],
+            "externalConsole": false,
+            "preLaunchTask": "build-bench",
+        },
+        {
             "type": "lldb-mi",
             "request": "launch",
             "name": "Debug (lldb)",

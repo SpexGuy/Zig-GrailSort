@@ -31,6 +31,14 @@
             "group": "build",
         },
         {
+            "label": "build-bench",
+            "type": "shell",
+            "command": "zig",
+            "args": ["build", "build-bench", "-Dtracy=false"],
+            "problemMatcher": [],
+            "group": "build",
+        },
+        {
             "label": "test",
             "type": "shell",
             "command": "zig",

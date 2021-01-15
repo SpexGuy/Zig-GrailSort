@@ -7,6 +7,16 @@ pub fn build(b: *Builder) void {
     const mode = b.standardReleaseOptions();
     const target = b.standardTargetOptions(.{});
 
+    const bench_exe = b.addExecutable("bench", "src/benchmark.zig");
+    setDependencies(b, bench_exe, mode, target);
+    bench_exe.install();
+
+    const bench_run = bench_exe.run();
+    if (b.args) |args| bench_run.addArgs(args);
+
+    const bench_step = b.step("bench", "Run benchmarks");
+    bench_step.dependOn(&bench_run.step);
+
     const vscode_exe = b.addExecutable("vscode", "src/vscode.zig");
     setDependencies(b, vscode_exe, mode, target);
 

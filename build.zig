@@ -25,6 +25,7 @@ pub fn build(b: *Builder) void {
 
     const vscode_exe = b.addExecutable("vscode", "src/vscode.zig");
     setDependencies(b, vscode_exe, mode, target);
+    linkTracy(vscode_exe, false);
 
     const vscode_install = b.addInstallArtifact(vscode_exe);
 

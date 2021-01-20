@@ -28,7 +28,7 @@ pub const enabled = blk: {
     break :blk root_enable orelse (build_enable orelse false);
 };
 
-const debug_verify_stack_order = true;
+const debug_verify_stack_order = false;
 
 usingnamespace if (enabled) tracy_full else tracy_stub;
 
@@ -150,11 +150,11 @@ const tracy_full = struct {
             var loc: c.___tracy_source_location_data = undefined;
         };
         static.loc = .{
-            .name = src.fn_name.ptr,
+            .name = name,
             .function = src.fn_name.ptr,
             .file = src.file.ptr,
             .line = src.line,
-            .color = 0,
+            .color = color,
         };
 
         const zone = if (has_callstack_support)

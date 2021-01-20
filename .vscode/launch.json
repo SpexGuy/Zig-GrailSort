@@ -39,7 +39,8 @@
             "environment": [],
             "externalConsole": false,
             "preLaunchTask": "build-bench-tracy",
-        },        {
+        },
+        {
             "name": "Release Benchmarks",
             "type": "cppvsdbg",
             "request": "launch",

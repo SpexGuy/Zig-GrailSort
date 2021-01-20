@@ -77,7 +77,7 @@ pub fn findOptimalBufferLength(array_len: usize) usize {
     // handles overflow when the length is close to MAX_USIZE.
     var block_len: usize = 4;
     var block_len_sq: usize = 16;
-    while (block_len_sq < array_len and block_len_sq != 0) {
+    while (block_len_sq + block_len < array_len and block_len_sq != 0) {
         block_len_sq <<= 2;
         block_len <<= 1;
     }
@@ -154,6 +154,10 @@ const TUNE_MIN_BUILD_BLOCKS_BUFFER = 4;
 /// If this is true, when running with an external buffer,
 /// the junk buffer will be filled with undefined.
 const DEBUG_SET_UNDEFINED = false;
+
+/// If this is true, the sort will validate that pieces are sorted
+/// at key points during the algorithm.
+const DEBUG_VALIDATE = false;
 
 /// Root sorting function, used by all public api points.
 fn sortCommon(
@@ -232,6 +236,7 @@ fn sortCommon(
     // TODO-OPT: We can probably use the external buffer to speed this
     // up if present.
     const keys_found = collectKeys(T, array, ideal_keys, cmp);
+    verifyKeys(T, array[0..keys_found], cmp);
 
     // In the event that the array contains very many duplicate elements,
     // we may not be able to find enough unique keys. In that case, use
@@ -293,6 +298,7 @@ fn sortCommon(
     } else {
         buildBlocksInPlace(T, array[first_data_idx - subarray_len..], subarray_len, cmp);
     }
+    verifySorted(T, array[first_data_idx..], 2*subarray_len, cmp);
 
     // At this point, pairs of blocks are sorted, so double the length.
     subarray_len *= 2;
@@ -354,6 +360,8 @@ fn sortCommon(
         }
 
         combineBlocks(T, array, first_data_idx, subarray_len, curr_block_len, mode, buffer, cmp);
+        verifySorted(T, array[first_data_idx..], 2*subarray_len, cmp);
+        verifyKeys(T, array[0..key_len], cmp);
 
         // TODO-OPT: We don't need to do this repeatedly if we have an ideal buffer.
         if (mode == .external_buffer) {
@@ -371,7 +379,13 @@ fn sortCommon(
     // external buffer.  Even though it's not big enough to hold the entire
     // keys array, it can still help reduce swaps (or let us do them as blocks).
     insertSort(T, array[0..first_data_idx], cmp);
+
+    verifySorted(T, array[0..first_data_idx], 0, cmp);
+    verifySorted(T, array[first_data_idx..], 0, cmp);
+
     lazyMerge(T, array, first_data_idx, cmp);
+
+    verifySorted(T, array, 0, cmp);
 }
 
 /// This function searches the list for the first ideal_keys unique elements.
@@ -456,15 +470,52 @@ fn collectKeys(comptime T: type, array: []T, ideal_keys: usize, cmp: anytype) us
 /// and always call buildBlocksExternal, to optimize the first few merges.
 /// As a bonus, this would let us delete the pairwiseSwaps function.
 fn buildBlocksInPlace(comptime T: type, array: []T, block_len: usize, cmp: anytype) void {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     // We'll use iterative merge sorts to perform this sort.
     // Start with an optimized version of merge sort with a size of 1.
     // This function will also move two items of the junk buffer to the
     // end of the array, not just one.
-    pairwiseSwaps(T, array[block_len-2..], cmp);
-    // Then continue doing larger merge sorts and moving items to the end
-    // of the array.  The last merge sort is done in reverse to move the
-    // junk buffer back to the beginning.
-    buildInPlace(T, array, 2, block_len, cmp);
+
+    const use_pairwise_swaps = false;
+    if (use_pairwise_swaps) {
+        pairwiseSwaps(T, array[block_len-2..], cmp);
+        buildInPlace(T, array, 2, block_len, cmp);
+    } else {
+        const merge_len = 2*block_len;
+        if (merge_len <= 16) {
+            var start = block_len;
+            while (start + merge_len <= array.len) : (start += merge_len) {
+                insertSort(T, array[start..][0..merge_len], cmp);
+            }
+            if (start < array.len) {
+                insertSort(T, array[start..], cmp);
+            }
+            verifyKeys(T, array[0..block_len], cmp);
+        } else {
+            var start = block_len;
+            while (start + 16 <= array.len) : (start += 16) {
+                // TODO-OPT: See if an in place insert sort and swap
+                // backwards is faster.
+                // TODO-OPT: Also do this with an external buffer.
+                // TODO-OPT: We could optimize the crap out of this at
+                // the assembly level.
+                blockSwap(T, array.ptr + (start - 16), array.ptr + start, 16);
+                insertSort(T, array[start-16..start], cmp);
+            }
+            if (start < array.len) {
+                moveBackToFront(T, array[start - 16..], array.len - start);
+                insertSort(T, array[start - 16..][0..array.len - start], cmp);
+            }
+
+            // Then continue doing larger merge sorts and moving items to the end
+            // of the array.  The last merge sort is done in reverse to move the
+            // junk buffer back to the beginning.
+            buildInPlace(T, array, 16, block_len, cmp);
+            verifyKeys(T, array[0..block_len], cmp);
+        }
+    }
 }
 
 /// Builds merge chunks in-place.  This function accepts an array that consists of
@@ -774,6 +825,7 @@ fn combineBlocks(
 
         // We need to make sure they are in order.
         insertSort(T, keys, cmp);
+        verifySortedStrict(T, keys, cmp);
 
         // blockSelectSort will do a selection sort on the blocks in the array.
         // It also permutes the keys to match.  This puts blocks in closer to the
@@ -787,6 +839,8 @@ fn combineBlocks(
         .inline_buffer   => mergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, block_count, block_len, 0, 0,   .inline_buffer, cmp),
         .external_buffer => mergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, block_count, block_len, 0, 0, .external_buffer, cmp),
         }
+
+        verifySorted(T, array[merge_start - junk_len..][0..full_merge_len], 0, cmp);
 
         merge_start += full_merge_len;
     }
@@ -805,6 +859,7 @@ fn combineBlocks(
         // hmm, we do always need one for the median though.
         const keys = keys_base[0..trailer_blocks+1];
         insertSort(T, keys, cmp);
+        verifySortedStrict(T, keys, cmp);
 
         // perform our selection sort as usual, including even blocks that
         // may not end up being part of the standard sort.  Only do this if
@@ -849,6 +904,8 @@ fn combineBlocks(
             .inline_buffer   => mergeIntoPrecedingJunk(T, array.ptr + merge_start, junk_len, left_len, trailer_items,   .inline_buffer, cmp),
             .external_buffer => mergeIntoPrecedingJunk(T, array.ptr + merge_start, junk_len, left_len, trailer_items, .external_buffer, cmp),
             }
+
+            verifySorted(T, array.ptr[merge_start - junk_len..array.len - junk_len], 0, cmp);
         } else {
             const unfit_items = block_len * unfit_trailer_blocks + trailer_items;
             // Common case, some blocks participate in the merge.
@@ -858,11 +915,16 @@ fn combineBlocks(
             .inline_buffer   => mergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, normal_blocks, block_len, unfit_trailer_blocks, unfit_items,   .inline_buffer, cmp),
             .external_buffer => mergeBlocks(T, keys.ptr, median_key, array.ptr + merge_start, normal_blocks, block_len, unfit_trailer_blocks, unfit_items, .external_buffer, cmp),
             }
+
+            verifySorted(T, array.ptr[merge_start - junk_len..array.len - junk_len], 0, cmp);
         }
 
         merge_start += leftover_count;
         assert(merge_start == array.len);
     }
+
+    const reset_tcc = tc.ZoneN(@src(), "BufferReset");
+    defer reset_tcc.End();
 
     // If we have a junk buffer, we need to move it back to the beginning of the list.
     // TODO-ZIG: Replace this with an inline switch or parameter when those are in.
@@ -871,6 +933,7 @@ fn combineBlocks(
     .inline_buffer   => moveFrontPastJunk(T, array[first_block_idx - junk_len..merge_start], merge_start - first_block_idx,   .inline_buffer),
     .external_buffer => moveFrontPastJunk(T, array[first_block_idx - junk_len..merge_start], merge_start - first_block_idx, .external_buffer),
     }
+    verifySorted(T, array[first_block_idx..], full_merge_len, cmp);
 }
 
 /// Performs a selection sort on the blocks in the array.  Only the first item
@@ -885,12 +948,17 @@ fn combineBlocks(
 /// Note that the blocks_ptr parameter points to the first valid block.  It does not include
 /// the junk buffer.
 fn blockSelectSort(comptime T: type, noalias keys_ptr: [*]T, noalias blocks_ptr: [*]T, initial_median: usize, block_count: usize, block_len: usize, cmp: anytype) usize {
+    const tcc = tc.Zone(@src());
+    defer tcc.End();
+
     const keys = keys_ptr[0..block_count];
     const blocks = blocks_ptr[0..block_count * block_len];
     assert(initial_median < block_count);
 
     // track the index of this block through the sort
     var median_key = initial_median;
+
+    const debug_median_value = if (DEBUG_VALIDATE) keys[initial_median] else {};
 
     // blocks to the left of left_block are sorted.
     var left_block: usize = 0;
@@ -947,6 +1015,15 @@ fn blockSelectSort(comptime T: type, noalias keys_ptr: [*]T, noalias blocks_ptr:
         }
     }
 
+    if (DEBUG_VALIDATE) {
+        assert(std.meta.eql(@as(T, debug_median_value), keys[median_key]));
+        var block_index: usize = 1;
+        while (block_index < block_count) : (block_index += 1) {
+            const rel = cmp.compare(blocks[(block_index-1) * block_len], blocks[block_index * block_len]);
+            assert(rel == .lt or (rel == .eq and cmp.lessThan(keys[block_index-1], keys[block_index])));
+        }
+    }
+
     return median_key;
 }
 
@@ -990,6 +1067,8 @@ fn countLastMergeBlocks(
     return blocks_to_merge_manually;
 }
 
+var debug_count: usize = 0;
+
 /// This function accepts a list of keys and a list of blocks.
 /// After calling it, the scratch buffer at the beginning of the
 /// array will be at the end (reordered), and all other items
@@ -1018,6 +1097,9 @@ fn mergeBlocks(
 ) void {
     const tcc = tc.Zone(@src());
     defer tcc.End();
+
+    const dbg = debug_count;
+    debug_count += 1;
 
     const junk_len = if (mode == .no_buffer) 0 else block_len;
 
@@ -1060,13 +1142,14 @@ fn mergeBlocks(
             // can just move it to the sorted part of the list, and swap it
             // with the displaced junk buffer.
             swapWithPrecedingJunk(T, blocks.ptr + curr_block, junk_len, curr_block_len, mode);
+            verifySorted(T, blocks[0..next_block - junk_len], 0, cmp);
 
             // After doing that, we know that the next block we grab will be a
             // full block, so set the length accordingly.
             curr_block_len = block_len;
         } else {
-            const tc_merge = tc.ZoneN(@src(), "Smart Merge");
-            defer tc_merge.End();
+            // const tc_merge = tc.ZoneN(@src(), "Smart Merge");
+            // defer tc_merge.End();
 
             // If the next two blocks don't come from same sub-array, they need
             // to be merged. We know that the last item in the left array is smaller
@@ -1152,6 +1235,7 @@ fn mergeBlocks(
                 // Update the current block to point to the remaining items.
                 // One of the following two terms must be zero.
                 curr_block_len = (right_end - right) + (left_end - left);
+                verifySorted(T, blocks[0..next_block + block_len - curr_block_len - junk_len], 0, cmp);
             } else {
                 // mode == .no_buffer
                 // In place merge sort.  This is pretty expensive, so make
@@ -1191,6 +1275,7 @@ fn mergeBlocks(
                         curr_block_len = block_len;
                         curr_block_from_left_subarray = next_block_from_left_subarray;
                     }
+                    verifySorted(T, blocks[0..next_block + block_len - curr_block_len - junk_len], 0, cmp);
                 } else {
                     if (!cmp.lessThan(blocks[next_block-1], blocks[next_block])) {
                         var rest = blocks[next_block - curr_block_len .. next_block + block_len];
@@ -1222,6 +1307,7 @@ fn mergeBlocks(
                         curr_block_len = block_len;
                         curr_block_from_left_subarray = next_block_from_left_subarray;
                     }
+                    verifySorted(T, blocks[0..next_block + block_len - curr_block_len - junk_len], 0, cmp);
                 } // curr_block_from_left_subarray
             } // mode != .no_buffer
         }
@@ -1233,6 +1319,8 @@ fn mergeBlocks(
     // At this point, we still have one partial array left to the right of the junk buffer.
     // curr_block here points to the start of that partial array.
     var curr_block = next_block - curr_block_len;
+    verifySorted(T, blocks[0..next_block - curr_block_len - junk_len], 0, cmp);
+
 
     // The trailer is the special case set of items at the very end of the array
     // that cannot be part of the normal merge process.  This is because they are
@@ -1256,8 +1344,12 @@ fn mergeBlocks(
             // sorted, and no items to the right of it will be part of it.
             // This means we can move the remaining items directly into the
             // sorted part of the array.
+            verifySorted(T, blocks[0..curr_block - junk_len], 0, cmp);
+            verifySorted(T, blocks[curr_block..next_block], 0, cmp);
+            if (DEBUG_VALIDATE) assert(!cmp.lessThan(blocks[curr_block], blocks[curr_block-junk_len-1]));
             swapWithPrecedingJunk(T, blocks.ptr + curr_block, junk_len, curr_block_len, mode);
             curr_block = next_block;
+            verifySorted(T, blocks[0..curr_block - junk_len], 0, cmp);
 
             // Everything after this point must come from the left array, for
             // the same reasons as in the other case.  We can fall back to a merge.
@@ -1270,12 +1362,15 @@ fn mergeBlocks(
         // Use a merge sort.  We can use the buffer here because the trailer is shorter
         // than a block.
         mergeIntoPrecedingJunk(T, blocks.ptr + curr_block, junk_len, curr_block_len, trailer_len - block_len * trailer_blocks, mode, cmp);
+        verifySorted(T, blocks[0..blocks.len - junk_len], 0, cmp);
     } else {
         // If there's no trailer (the common case), any remaining items are
         // sorted.  We just need to move the buffer across them, so that the
         // next iteration can use it.
         swapWithPrecedingJunk(T, blocks.ptr + curr_block, junk_len, curr_block_len, mode);
+        verifySorted(T, blocks[0..blocks.len - junk_len], 0, cmp);
     }
+
 }
 
 /// Merges two arrays, using the preceding junk buffer to accelerate the operation.
@@ -1323,8 +1418,6 @@ inline fn moveFrontPastJunk(comptime T: type, array: []T, data_len: usize, compt
 /// while rotating the sliding buffer to the end.  The sliding buffer may be reordered
 /// during this process.
 fn mergeForwards(comptime T: type, data_start: [*]T, buffer_len: usize, left_len: usize, right_len: usize, cmp: anytype) void {
-    const tcc = tc.Zone(@src());
-    defer tcc.End();
     // The buffer must be at least as large as the right array,
     // to prevent overwriting the left array.
     assert(buffer_len >= right_len);
@@ -1332,9 +1425,9 @@ fn mergeForwards(comptime T: type, data_start: [*]T, buffer_len: usize, left_len
     // we will do everything relative to the start of the buffer.
     const array = data_start - buffer_len;
 
-    // tracking iterators for our three sections
-    var buffer: usize = 0;
-    var left = buffer_len;
+    // tracking iterator pointers for our three sections
+    var buffer = array;
+    var left = buffer + buffer_len;
     const left_end = left + left_len;
     var right = left_end;
     const right_end = right + right_len;
@@ -1342,18 +1435,40 @@ fn mergeForwards(comptime T: type, data_start: [*]T, buffer_len: usize, left_len
     // Pretty standard merge sort, but merge into the buffer.
     // While doing this, move the buffer data into the merged out slots.
     // Loop until the entire right side is consumed.
-    while (right < right_end) {
-        // TODO-OPT: This could be made branchless, test that and see if it's faster.
-        if (left >= left_end or cmp.lessThan(array[right], array[left])) {
-            const tmp = array[buffer];
-            array[buffer] = array[right];
-            array[right] = tmp;
-            right += 1;
+    while (@ptrToInt(right) < @ptrToInt(right_end)) {
+        // TODO-OPT: Branchless is much better for sorting random inputs,
+        // but much worse for inputs that are already mostly sorted.
+        // Consider allowing the caller to pass a hint parameter which
+        // selects one or the other.
+        const branchless = false;
+        if (branchless) {
+            if (@ptrToInt(left) < @ptrToInt(left_end)) {
+                const from_right = mask(cmp.lessThan(right[0], left[0]));
+                const read_ptr_usize = (@ptrToInt(left) & ~from_right) | (@ptrToInt(right) & from_right);
+                const read_ptr = @intToPtr([*]T, read_ptr_usize);
+                const tmp = buffer[0];
+                buffer[0] = read_ptr[0];
+                read_ptr[0] = tmp;
+                right += from_right & 1;
+                left += ~from_right & 1;
+            } else {
+                const tmp = buffer[0];
+                buffer[0] = right[0];
+                right[0] = tmp;
+                right += 1;
+            }
         } else {
-            const tmp = array[buffer];
-            array[buffer] = array[left];
-            array[left] = tmp;
-            left += 1;
+            if (@ptrToInt(left) >= @ptrToInt(left_end) or cmp.lessThan(right[0], left[0])) {
+                const tmp = buffer[0];
+                buffer[0] = right[0];
+                right[0] = tmp;
+                right += 1;
+            } else {
+                const tmp = buffer[0];
+                buffer[0] = left[0];
+                left[0] = tmp;
+                left += 1;
+            }
         }
         buffer += 1;
     }
@@ -1365,8 +1480,20 @@ fn mergeForwards(comptime T: type, data_start: [*]T, buffer_len: usize, left_len
         // TODO-OPT: This can alias if right_len < buffer_len.
         // We usually know statically at the call site if that
         // is the case, is it worth bifurcating codegen?
-        moveBackToFront(T, array[buffer..left_end], left_end - left);
+        moveBackToFront(T, ptrSlice(T, buffer, left_end), ptrDiff(T, left, left_end));
     }
+}
+
+inline fn ptrSlice(comptime T: type, start: [*]T, end: [*]T) []T {
+    return start[0..ptrDiff(T, start, end)];
+}
+
+inline fn ptrDiff(comptime T: type, left: [*]T, right: [*]T) usize {
+    return @divExact(@ptrToInt(right) - @ptrToInt(left), @sizeOf(T));
+}
+
+inline fn mask(bit: bool) usize {
+    return @bitCast(usize, -@intCast(isize, @boolToInt(bit)));
 }
 
 /// Like mergeForwards, this function accepts an array made up of three parts:
@@ -1549,8 +1676,6 @@ fn lazyStableSort(comptime T: type, array: []T, cmp: anytype) void {
 /// be preferred if possible.
 /// TODO-OPT: This can absolutely use external storage if available.
 fn lazyMerge(comptime T: type, array: []T, left_len: usize, cmp: anytype) void {
-    const tcc = tc.Zone(@src());
-    defer tcc.End();
     // For performance, always sort the shorter array into the longer one.
     // TODO-OPT: The reference implementation has a tight loop to recognize
     // when multiple keys are already in order and avoid unnecessary binary
@@ -1660,9 +1785,6 @@ fn moveFrontToBack(
     array: []T,
     buffer_len: usize,
 ) void {
-    const tcc = tc.Zone(@src());
-    defer tcc.End();
-
     // TODO-OPT: Use a stack buffer to accelerate this, or use SSE
     var front = buffer_len;
     var back = array.len;
@@ -1699,9 +1821,6 @@ fn moveBackToFront(
     array: []T,
     buffer_len: usize,
 ) void {
-    const tcc = tc.Zone(@src());
-    defer tcc.End();
-
     // TODO-OPT: Use a stack buffer to accelerate this, or use SSE
     var front: usize = 0;
     var back = array.len - buffer_len;
@@ -1807,6 +1926,42 @@ fn emptySlice(comptime T: type) []T {
 inline fn setUndefined(comptime T: type, data: []T) void {
     if (DEBUG_SET_UNDEFINED) {
         for (data) |*v| v.* = undefined;
+    }
+}
+
+inline fn verifyKeys(comptime T: type, keys: []T, cmp: anytype) void {
+    if (DEBUG_VALIDATE) {
+        insertSort(T, keys, cmp);
+        verifySortedStrict(T, keys, cmp);
+    }
+}
+
+inline fn verifySorted(comptime T: type, data: []T, sorted_len: usize, cmp: anytype) void {
+    if (DEBUG_VALIDATE) {
+        if (data.len < 2) return;
+        var block_len = if (sorted_len == 0) data.len else sorted_len;
+        var start: usize = 0;
+        while (start + block_len <= data.len) : (start += block_len) {
+            var part = data[start..][0..block_len];
+            for (part[1..]) |v, i| {
+                assert(!cmp.lessThan(v, part[i]));
+            }
+        }
+        if (start < data.len) {
+            var part2 = data[start..];
+            for (part2[1..]) |v2, j| {
+                assert(!cmp.lessThan(v2, part2[j]));
+            }
+        }
+    }
+}
+
+inline fn verifySortedStrict(comptime T: type, data: []T, cmp: anytype) void {
+    if (DEBUG_VALIDATE) {
+        if (data.len < 2) return;
+        for (data[1..]) |v, i| {
+            assert(cmp.lessThan(data[i], v));
+        }
     }
 }
 

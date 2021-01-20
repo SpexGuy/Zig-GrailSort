@@ -50,7 +50,7 @@
             "label": "build-bench-release",
             "type": "shell",
             "command": "zig",
-            "args": ["build", "build-bench", "-Drelease-safe=true"],
+            "args": ["build", "build-bench", "-Drelease-safe=true", "-Dtracy=false"],
             "problemMatcher": [],
             "group": "build",
         },

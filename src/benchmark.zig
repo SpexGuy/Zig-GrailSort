@@ -9,32 +9,76 @@ const gpa = &gpa_storage.allocator;
 
 const verify_sorted = true;
 
+var test_words: []const [:0]const u8 = &[_][:0]const u8{};
+
 pub fn main() void {
     tracy.InitThread();
     tracy.SetThreadName("main");
 
+    readTestData();
+
+    doStringTests();
+    //doFloatTests(f64);
+    //doFloatTests(f32);
     //doIntTests(u8);
+    //doIntTests(u32);
+    //doIntTests(u64);
     //doIntTests(i32);
-    doIntTests(u32);
-    //doIntTests(usize);
 }
 
 fn doIntTests(comptime T: type) void {
     //doAllKeyCases("std.sort" , "unique", T, std.sort.sort, comptime std.sort.asc(T) , comptime doIntCast(T));
     doAllKeyCases("grailsort", "unique", T, grail.sort   , comptime std.sort.asc(T) , comptime doIntCast(T));
     //doAllKeyCases("std.sort" , "x2"    , T, std.sort.sort, comptime removeBits(T, 1), comptime doIntCast(T));
-    doAllKeyCases("grailsort", "x2"    , T, grail.sort   , comptime removeBits(T, 1), comptime doIntCast(T));
+    //doAllKeyCases("grailsort", "x2"    , T, grail.sort   , comptime removeBits(T, 1), comptime doIntCast(T));
     //doAllKeyCases("std.sort" , "x8"    , T, std.sort.sort, comptime removeBits(T, 3), comptime doIntCast(T));
-    doAllKeyCases("grailsort", "x8"    , T, grail.sort   , comptime removeBits(T, 3), comptime doIntCast(T));
+    //doAllKeyCases("grailsort", "x8"    , T, grail.sort   , comptime removeBits(T, 3), comptime doIntCast(T));
     //doAllKeyCases("std.sort" , "x32"   , T, std.sort.sort, comptime removeBits(T, 5), comptime doIntCast(T));
     doAllKeyCases("grailsort", "x32"   , T, grail.sort   , comptime removeBits(T, 5), comptime doIntCast(T));
 }
 
-fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comptime sortFn: anytype, comptime lessThan: fn(void, T, T) bool, comptime fromInt: fn(usize) T) void {
-    const ctx = tracy.Zone(@src());
-    defer ctx.End();
+fn doFloatTests(comptime T: type) void {
+    //doAllKeyCases("std.sort" , "unique", T, std.sort.sort, comptime std.sort.asc(T) , comptime genFloats(T, 1));
+    doAllKeyCases("grailsort", "unique", T, grail.sort   , comptime std.sort.asc(T) , comptime genFloats(T, 1));
+    //doAllKeyCases("std.sort" , "x2"    , T, std.sort.sort, comptime std.sort.asc(T), comptime genFloats(T, 2));
+    //doAllKeyCases("grailsort", "x2"    , T, grail.sort   , comptime std.sort.asc(T), comptime genFloats(T, 2));
+    //doAllKeyCases("std.sort" , "x8"    , T, std.sort.sort, comptime std.sort.asc(T), comptime genFloats(T, 8));
+    //doAllKeyCases("grailsort", "x8"    , T, grail.sort   , comptime std.sort.asc(T), comptime genFloats(T, 8));
+    //doAllKeyCases("std.sort" , "x32"   , T, std.sort.sort, comptime std.sort.asc(T), comptime genFloats(T, 32));
+    doAllKeyCases("grailsort", "x32"   , T, grail.sort   , comptime std.sort.asc(T), comptime genFloats(T, 32));
+}
 
-    ctx.Name(benchmark);
+fn doStringTests() void {
+    const gen = struct {
+        pub fn lessSlice(_: void, lhs: []const u8, rhs: []const u8) bool {
+            return std.mem.lessThan(u8, lhs, rhs);
+        }
+        pub fn sliceAt(idx: usize) []const u8 {
+            return test_words[idx % test_words.len];
+        }
+        pub fn lessPtr(_: void, lhs: [*:0]const u8, rhs: [*:0]const u8) bool {
+            var a = lhs;
+            var b = rhs;
+            while (true) {
+                if (a[0] != b[0]) return a[0] < b[0];
+                if (a[0] == 0) return false;
+                a += 1;
+                b += 1;
+            }
+        }
+        pub fn ptrAt(idx: usize) [*:0]const u8 {
+            return test_words[idx % test_words.len].ptr;
+        }
+    };
+    doAllKeyCases("grailsort", "unique", []const u8, grail.sort, gen.lessSlice, gen.sliceAt);
+    doAllKeyCases("grailsort", "unique", [*:0]const u8, grail.sort, gen.lessPtr, gen.ptrAt);
+    doAllKeyCases("grailsort", "x32", []const u8, grail.sort, gen.lessSlice, comptime repeat([]const u8, gen.sliceAt, 32));
+    doAllKeyCases("grailsort", "x32", [*:0]const u8, grail.sort, gen.lessPtr, comptime repeat([*:0]const u8, gen.ptrAt, 32));
+}
+
+fn doAllKeyCases(comptime sort: []const u8, comptime benchmark: []const u8, comptime T: type, comptime sortFn: anytype, comptime lessThan: fn(void, T, T) bool, comptime fromInt: fn(usize) T) void {
+    const ctx = tracy.ZoneN(@src(), sort ++ " " ++ @typeName(T) ++ " " ++ benchmark);
+    defer ctx.End();
 
     const max_len = 10_000_000;
 
@@ -48,50 +92,58 @@ fn doAllKeyCases(sort: []const u8, benchmark: []const u8, comptime T: type, comp
     var seed_rnd = std.rand.DefaultPrng.init(42);
 
     for (golden) |*v, i| v.* = fromInt(i);
-    checkSorted(T, golden, lessThan);
+    //checkSorted(T, golden, lessThan);
 
     print(" --------------- {: >9} {} {} ---------------- \n", .{sort, @typeName(T), benchmark});
     print("    Items : ns / item |    ms avg |    ms max |    ms min\n", .{});
  
-    var array_len: usize = 10000;
-    while (array_len <= max_len) : (array_len *= 10) {
-        const len_zone = tracy.ZoneN(@src(), "len");
-        defer len_zone.End();
-        len_zone.Value(array_len);
+    var block_size: usize = 4;
+    var array_len: usize = block_size * block_size + (block_size/2-1);
+    while (array_len <= max_len) : ({block_size *= 2; array_len = block_size * block_size + (block_size/2-1);}) {
+        for ([_]bool{true, false}) |randomized| {
+            const len_zone = tracy.ZoneN(@src(), "len");
+            defer len_zone.End();
+            len_zone.Value(array_len);
 
-        var runs = 100_000_000 / array_len;
-        if (runs > 1000) runs = 1000;
-        var run_rnd = std.rand.DefaultPrng.init(seed_rnd.random.int(u64));
+            var runs = 10_000_000 / array_len;
+            if (runs > 100) runs = 100;
+            if (runs < 10) runs = 10;
+            var run_rnd = std.rand.DefaultPrng.init(seed_rnd.random.int(u64));
 
-        tracy.PlotU("Array Size", array_len);
+            tracy.PlotU("Array Size", array_len);
 
-        var min_time: u64 = ~@as(u64, 0);
-        var max_time: u64 = 0;
-        var total_time: u64 = 0;
-        var total_cycles: u64 = 0;
+            var min_time: u64 = ~@as(u64, 0);
+            var max_time: u64 = 0;
+            var total_time: u64 = 0;
+            var total_cycles: u64 = 0;
 
-        var run_id: usize = 0;
-        while (run_id < runs) : (run_id += 1) {
-            const seed = run_rnd.random.int(u64);
+            var run_id: usize = 0;
+            while (run_id < runs) : (run_id += 1) {
+                const seed = run_rnd.random.int(u64);
 
-            const part = array[0..array_len];
-            setRandom(T, part, golden[0..array_len], seed);
+                const part = array[0..array_len];
+                if (randomized) {
+                    setRandom(T, part, golden[0..array_len], seed);
+                } else {
+                    std.mem.copy(T, part, golden[0..array_len]);
+                }
 
-            var time = std.time.Timer.start() catch unreachable;
-            sortFn(T, part, {}, lessThan);
-            const elapsed = time.read();
+                var time = std.time.Timer.start() catch unreachable;
+                sortFn(T, part, {}, lessThan);
+                const elapsed = time.read();
 
-            checkSorted(T, part, lessThan);
+                checkSorted(T, part, lessThan);
 
-            if (elapsed < min_time) min_time = elapsed;
-            if (elapsed > max_time) max_time = elapsed;
-            total_time += elapsed;
+                if (elapsed < min_time) min_time = elapsed;
+                if (elapsed > max_time) max_time = elapsed;
+                total_time += elapsed;
+            }
+
+            const avg_time = total_time / runs;
+            print("{: >9} : {d: >9.3} | {d: >9.3} | {d: >9.3} | {d: >9.3} | random={}\n",
+                .{ array_len, @intToFloat(f64, avg_time) / @intToFloat(f64, array_len),
+                    millis(avg_time), millis(max_time), millis(min_time), randomized });
         }
-
-        const avg_time = total_time / runs;
-        print("{: >9} : {d: >9.3} | {d: >9.3} | {d: >9.3} | {d: >9.3}\n",
-            .{ array_len, @intToFloat(f64, avg_time) / @intToFloat(f64, array_len),
-                millis(avg_time), millis(max_time), millis(min_time) });
     }
 }
 
@@ -128,6 +180,22 @@ fn doIntCast(comptime T: type) fn(usize) T {
     }.doCast;
 }
 
+fn genFloats(comptime T: type, comptime repeats: comptime_int) fn(usize) T {
+    return struct {
+        fn genFloat(v: usize) T {
+            return @intToFloat(T, v / repeats);
+        }
+    }.genFloat;
+}
+
+fn repeat(comptime T: type, comptime inner: fn(usize)T, comptime repeats: comptime_int) fn(usize)T {
+    return struct {
+        inline fn gen(v: usize) T {
+            return inner(v / repeats);
+        }
+    }.gen;
+}
+
 fn removeBits(comptime T: type, comptime bits: comptime_int) fn(void, T, T) bool {
     return struct {
         fn shiftLess(_: void, a: T, b: T) bool {
@@ -151,4 +219,29 @@ fn nanosToCycles(nanos: u64) u64 {
     // assume that we're running on a skylake processor or similar,
     // which updates at 24 MHz
     return nanos * 24 / 1000;
+}
+
+fn readTestData() void {
+    const file = std.fs.cwd().openFile("data\\words.txt", .{}) catch unreachable;
+    const bytes = file.readToEndAlloc(gpa, 10 * 1024 * 1024) catch unreachable;
+    
+    var words_array = std.ArrayList([:0]const u8).init(gpa);
+    // don't free this list, we will keep pointers into it
+    // for the entire lifetime of the program.
+
+    var total_len: usize = 0;
+    words_array.ensureCapacity(500_000) catch unreachable;
+    var words = std.mem.tokenize(bytes, &[_]u8{ '\n', '\r', 0 });
+    while (words.next()) |word| {
+        // the file must end with a newline, or this won't work.
+        const mut_word = @intToPtr([*]u8, @ptrToInt(word.ptr));
+        mut_word[word.len] = 0;
+        total_len += word.len;
+        words_array.append(mut_word[0..word.len :0]) catch unreachable;
+    }
+
+    // save the slice to our test list.
+    test_words = words_array.toOwnedSlice();
+
+    print("avg word len: {}\n", .{@intToFloat(f64, total_len) / @intToFloat(f64, test_words.len)});
 }

@@ -49,7 +49,7 @@ fn linkTracy(step: *LibExeObjStep, enable: bool) void {
         });
     }
     
-    if (step.target.isWindows()) {
+    if (enable and step.target.isWindows()) {
         step.linkSystemLibrary("Advapi32");
         step.linkSystemLibrary("User32");
     }
